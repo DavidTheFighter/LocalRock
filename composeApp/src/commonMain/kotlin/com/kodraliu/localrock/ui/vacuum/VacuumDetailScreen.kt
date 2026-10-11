@@ -54,6 +54,8 @@ import androidx.compose.material.icons.filled.Error
 import androidx.compose.material.icons.filled.Gamepad
 import androidx.compose.material.icons.filled.GridView
 import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.Map
@@ -136,14 +138,17 @@ import com.kodraliu.localrock.shared.vacuum.DockErrorCodes
 import com.kodraliu.localrock.shared.vacuum.DockSettings
 import com.kodraliu.localrock.shared.vacuum.FloorMap
 import com.kodraliu.localrock.shared.vacuum.MopRoute
+import com.kodraliu.localrock.shared.vacuum.RoomCleanMode
 import com.kodraliu.localrock.shared.vacuum.SWITCH_MAP_MODE_SMART
 import com.kodraliu.localrock.shared.vacuum.VacuumErrorCodes
 import com.kodraliu.localrock.shared.vacuum.VacuumFanPower
 import com.kodraliu.localrock.shared.vacuum.VacuumStateCodes
 import com.kodraliu.localrock.shared.vacuum.VacuumStatus
 import com.kodraliu.localrock.shared.vacuum.WaterBoxMode
+import com.kodraliu.localrock.shared.vacuum.isCustomizeModeSet
 import com.kodraliu.localrock.shared.vacuum.isSmartModeSet
 import com.kodraliu.localrock.shared.vacuum.mapNameBlocker
+import com.kodraliu.localrock.shared.vacuum.roomCleanModesFor
 import com.kodraliu.localrock.shared.vacuum.map.ParsedMap
 import com.kodraliu.localrock.shared.vacuum.map.ParsedMapRoom
 import com.kodraliu.localrock.shared.vacuum.map.roomAtNorm
@@ -157,6 +162,9 @@ private val FAN_OPTIONS = listOf(
     VacuumFanPower.TURBO to "Strong",
     VacuumFanPower.MAX to "MAX",
 )
+
+/** A room can also go without suction, the official app's mop-only setting. */
+private val ROOM_FAN_OPTIONS = listOf(VacuumFanPower.OFF to "Off") + FAN_OPTIONS
 
 private val WATER_OPTIONS = listOf(
     WaterBoxMode.OFF to "Off",
@@ -200,12 +208,14 @@ fun VacuumDetailScreen(
     val maxFloorMaps by viewModel.repository.maxFloorMaps.collectAsState()
     val unsavedMap by viewModel.repository.unsavedMapPresent.collectAsState()
     val mopMode by viewModel.repository.mopMode.collectAsState()
+    val roomCleanModes by viewModel.repository.roomCleanModes.collectAsState()
     val dockSettings by viewModel.repository.dockSettings.collectAsState()
     var selectedRoomIds by remember { mutableStateOf(emptyList<Int>()) }
 
     var sessionRoomIds by remember { mutableStateOf(emptyList<Int>()) }
     var showDockSheet by remember { mutableStateOf(false) }
     var showRoomsSheet by remember { mutableStateOf(false) }
+    var showOrderSheet by remember { mutableStateOf(false) }
     var showMoreSheet by remember { mutableStateOf(false) }
     var showCleaningModeSheet by remember { mutableStateOf(false) }
     var showRecoverSheet by remember { mutableStateOf(false) }
@@ -241,6 +251,16 @@ fun VacuumDetailScreen(
     }
     LaunchedEffect(showCleaningModeSheet) {
         if (showCleaningModeSheet) runCatching { viewModel.repository.fetchMopMode() }
+    }
+    val perRoomMode = isCustomizeModeSet(status.fanPower, status.waterBoxCustomMode, mopMode)
+    // Null while the robot's room settings are being read, false when that failed. Saving is only
+    // offered once they are known, or the defaults shown meanwhile would overwrite them.
+    var roomModesLoaded by remember { mutableStateOf<Boolean?>(null) }
+    LaunchedEffect(showCleaningModeSheet, perRoomMode) {
+        roomModesLoaded = null
+        if (showCleaningModeSheet && perRoomMode) {
+            roomModesLoaded = runCatching { viewModel.repository.fetchRoomCleanModes() }.isSuccess
+        }
     }
     LaunchedEffect(showDockSheet) {
         if (showDockSheet) runCatching { viewModel.repository.fetchDockSettings() }
@@ -306,7 +326,8 @@ fun VacuumDetailScreen(
                 selectedRoomCount = selectedRoomIds.size,
                 onClean = {
                     sessionRoomIds = emptyList()
-                    viewModel.run("Cleaning started") { it.clean() }
+                    val order = viewModel.defaultCleanOrder()
+                    viewModel.run("Cleaning started") { it.clean(order) }
                 },
                 onCleanRooms = {
                     val toClean = selectedRoomIds
@@ -375,6 +396,28 @@ fun VacuumDetailScreen(
                     showRoomsSheet = false
                     viewModel.refreshMap()
                 },
+                onDefaultOrder = {
+                    showRoomsSheet = false
+                    showOrderSheet = true
+                },
+            )
+        }
+    }
+
+    if (showOrderSheet) {
+        ModalBottomSheet(onDismissRequest = { showOrderSheet = false }) {
+            CleanOrderSheetContent(
+                rooms = parsedMap?.rooms ?: emptyList(),
+                savedOrder = remember(currentFloorFlag) { viewModel.defaultCleanOrder() },
+                busy = busy,
+                onSave = { order ->
+                    showOrderSheet = false
+                    viewModel.saveDefaultCleanOrder(order)
+                },
+                onRemove = {
+                    showOrderSheet = false
+                    viewModel.removeDefaultCleanOrder()
+                },
             )
         }
     }
@@ -407,6 +450,7 @@ fun VacuumDetailScreen(
                 blockedReason = viewModel.repository.mapManageBlockedReason(status.state),
                 canAddMap = floorMaps.size < (maxFloorMaps ?: 1),
                 unsavedMap = unsavedMap,
+                mapSaving = status.mapSavingEnabled,
                 multiLevel = status.multiLevelEnabled,
                 smartSwitching = status.switchMapMode?.let { it == SWITCH_MAP_MODE_SMART },
                 onMultiLevelChange = { on ->
@@ -417,6 +461,7 @@ fun VacuumDetailScreen(
                     }
                 },
                 onSmartSwitchingChange = { smart -> viewModel.run { it.setSmartMapSwitching(smart) } },
+                onEnableMapSaving = { viewModel.run("Map saving on") { it.enableMapSaving() } },
                 onLoad = { flag ->
                     showRecoverSheet = false
                     viewModel.run { it.switchFloor(flag) }
@@ -476,16 +521,24 @@ fun VacuumDetailScreen(
                 cleaningCount = cleaningCount,
                 busy = busy,
                 supportsSmartPlan = viewModel.supportsSmartPlan,
-                onSmartPlanSelected = { smart ->
+                rooms = parsedMap?.rooms ?: emptyList(),
+                roomCleanModes = roomCleanModes,
+                roomModesLoaded = roomModesLoaded,
+                onPlanSelected = { plan ->
                     viewModel.run {
-                        if (smart) it.setCleanMotorMode(VacuumFanPower.SMART, WaterBoxMode.SMART, MopRoute.SMART)
-                        else {
-                            // Water slide robots get a slide code, as python-roborock does.
-                            val water = if (viewModel.supportsWaterSlide) WaterBoxMode.SLIDE_MEDIUM else WaterBoxMode.LOW
-                            it.setCleanMotorMode(VacuumFanPower.BALANCED, water, MopRoute.STANDARD)
+                        when (plan) {
+                            CleanPlan.SMART -> it.setCleanMotorMode(VacuumFanPower.SMART, WaterBoxMode.SMART, MopRoute.SMART)
+                            CleanPlan.MANUAL -> {
+                                // Water slide robots get a slide code, as python-roborock does.
+                                val water = if (viewModel.supportsWaterSlide) WaterBoxMode.SLIDE_MEDIUM else WaterBoxMode.LOW
+                                it.setCleanMotorMode(VacuumFanPower.BALANCED, water, MopRoute.STANDARD)
+                            }
+                            // The three codes the official app sent for its Customize tab.
+                            CleanPlan.PER_ROOM -> it.setCleanMotorMode(VacuumFanPower.CUSTOM, WaterBoxMode.CUSTOM, MopRoute.CUSTOM)
                         }
                     }
                 },
+                onSaveRoomModes = { modes -> viewModel.run("Room settings saved") { it.saveRoomCleanModes(modes) } },
                 onFanPowerSelected = { level -> viewModel.run { it.setFanPower(level) } },
                 onWaterModeSelected = { level -> viewModel.run { it.setWaterBoxMode(level) } },
                 onRouteSelected = { mode -> viewModel.run { it.setMopMode(mode) } },
@@ -986,7 +1039,16 @@ private fun ControlBar(
         ) {
             AssistChip(
                 onClick = onCleaningMode,
-                label = { Text(if (isSmartModeSet(status.fanPower, status.waterBoxCustomMode, null)) "SmartPlan" else if (mopping) "Vac & Mop" else "Vacuum") },
+                label = {
+                    Text(
+                        when {
+                            isSmartModeSet(status.fanPower, status.waterBoxCustomMode, null) -> CleanPlan.SMART.label
+                            isCustomizeModeSet(status.fanPower, status.waterBoxCustomMode, null) -> CleanPlan.PER_ROOM.label
+                            mopping -> "Vac & Mop"
+                            else -> "Vacuum"
+                        }
+                    )
+                },
                 leadingIcon = {
                     Icon(Icons.Default.Tune, contentDescription = null, modifier = Modifier.size(18.dp))
                 },
@@ -1151,7 +1213,11 @@ private fun CleaningModeSheetContent(
     cleaningCount: Int,
     busy: Boolean,
     supportsSmartPlan: Boolean,
-    onSmartPlanSelected: (Boolean) -> Unit,
+    rooms: List<ParsedMapRoom>,
+    roomCleanModes: List<RoomCleanMode>,
+    roomModesLoaded: Boolean?,
+    onPlanSelected: (CleanPlan) -> Unit,
+    onSaveRoomModes: (List<RoomCleanMode>) -> Unit,
     onFanPowerSelected: (Int) -> Unit,
     onWaterModeSelected: (Int) -> Unit,
     onRouteSelected: (Int) -> Unit,
@@ -1165,13 +1231,25 @@ private fun CleaningModeSheetContent(
     var selectedTab by remember { mutableIntStateOf(initialTab) }
     // SmartPlan owns suction, water and route; the robot rejects manual changes until it is left.
     val smart = isSmartModeSet(currentFanPower, currentWaterMode, currentRoute)
+    // Per-room settings report their own codes for all three as well.
+    val perRoom = isCustomizeModeSet(currentFanPower, currentWaterMode, currentRoute)
+    val plan = when {
+        smart -> CleanPlan.SMART
+        perRoom -> CleanPlan.PER_ROOM
+        else -> CleanPlan.MANUAL
+    }
+    val plans = buildList {
+        if (supportsSmartPlan || smart) add(CleanPlan.SMART)
+        add(CleanPlan.MANUAL)
+        if (rooms.isNotEmpty() || perRoom) add(CleanPlan.PER_ROOM)
+    }
 
     Column(Modifier.fillMaxWidth().navigationBarsPadding().padding(bottom = 16.dp)) {
         Spacer(Modifier.height(12.dp))
-        if (supportsSmartPlan || smart) {
+        if (plans.size > 1) {
             Box(Modifier.padding(horizontal = 24.dp).padding(bottom = 12.dp)) {
-                ModeOptionSelector("Mode", listOf("SmartPlan", "Manual"), if (smart) 0 else 1, !busy) {
-                    if ((it == 0) != smart) onSmartPlanSelected(it == 0)
+                ModeOptionSelector("Mode", plans.map { it.label }, plans.indexOf(plan), !busy) {
+                    if (plans[it] != plan) onPlanSelected(plans[it])
                 }
             }
         }
@@ -1179,6 +1257,18 @@ private fun CleaningModeSheetContent(
             Column(Modifier.padding(horizontal = 24.dp, vertical = 16.dp), verticalArrangement = Arrangement.spacedBy(20.dp)) {
                 Text("SmartPlan picks suction, water and route for each room.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 CountSelector(cleaningCount, onCountChange)
+            }
+        } else if (perRoom) {
+            if (roomModesLoaded == true) {
+                RoomCleanModesEditor(rooms, roomCleanModes, busy, onSaveRoomModes)
+            } else {
+                Text(
+                    if (roomModesLoaded == null) "Reading the room settings from the robot."
+                    else "Couldn't read the room settings from the robot. Close this sheet and open it again.",
+                    modifier = Modifier.padding(horizontal = 24.dp, vertical = 16.dp),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
         } else {
             SecondaryTabRow(selectedTabIndex = selectedTab) {
@@ -1228,6 +1318,97 @@ private fun CleaningModeSheetContent(
                         2 -> { suction(); CountSelector(cleaningCount, onCountChange) }
                     }
                 }
+            }
+        }
+    }
+}
+
+private enum class CleanPlan(val label: String) {
+    SMART("SmartPlan"),
+    MANUAL("Manual"),
+    PER_ROOM("Per room"),
+}
+
+private fun roomModeSummary(mode: RoomCleanMode): String {
+    val fan = ROOM_FAN_OPTIONS.firstOrNull { it.first == mode.fanPower }?.second ?: "Other"
+    val water = WATER_OPTIONS.firstOrNull { it.first == WaterBoxMode.normalize(mode.waterBoxMode) }?.second ?: "Other"
+    return when {
+        mode.waterBoxMode == WaterBoxMode.OFF -> "Vacuum $fan"
+        mode.fanPower == VacuumFanPower.OFF -> "Mop $water"
+        else -> "Vacuum $fan, mop $water"
+    }
+}
+
+/**
+ * One row per room on the map; a tapped room opens its suction, water and route. Nothing is sent
+ * until Save, which writes every room in one command.
+ */
+@Composable
+private fun RoomCleanModesEditor(
+    rooms: List<ParsedMapRoom>,
+    stored: List<RoomCleanMode>,
+    busy: Boolean,
+    onSave: (List<RoomCleanMode>) -> Unit,
+) {
+    val saved = remember(rooms, stored) { roomCleanModesFor(rooms.map { it.id }, stored) }
+    var draft by remember(saved) { mutableStateOf(saved) }
+    var openSegment by remember { mutableStateOf<Int?>(null) }
+    // Rooms the robot has no settings for yet still need the first save.
+    val unsaved = draft != saved || rooms.any { room -> stored.none { it.segment == room.id } }
+
+    Column(Modifier.padding(horizontal = 24.dp, vertical = 16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        Text(
+            if (rooms.isEmpty()) "Load the map to set up each room."
+            else "Each room is cleaned with its own suction, water and route.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Column(Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState())) {
+            rooms.forEachIndexed { index, room ->
+                val mode = draft.firstOrNull { it.segment == room.id } ?: return@forEachIndexed
+                val open = openSegment == room.id
+                val update = { changed: RoomCleanMode ->
+                    draft = draft.map { if (it.segment == room.id) changed else it }
+                }
+                if (index > 0) HorizontalDivider()
+                Surface(onClick = { openSegment = if (open) null else room.id }, color = Color.Transparent) {
+                    Row(Modifier.fillMaxWidth().padding(vertical = 14.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            room.name,
+                            modifier = Modifier.weight(1f),
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Medium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Text(roomModeSummary(mode), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+                    }
+                }
+                if (open) {
+                    Column(Modifier.padding(bottom = 16.dp), verticalArrangement = Arrangement.spacedBy(20.dp)) {
+                        ModeOptionSelector("Suction power", ROOM_FAN_OPTIONS.map { it.second }, ROOM_FAN_OPTIONS.indexOfFirst { it.first == mode.fanPower }, !busy) {
+                            val fan = ROOM_FAN_OPTIONS[it].first
+                            // A room with neither suction nor water would not be cleaned at all.
+                            val water = if (fan == VacuumFanPower.OFF && mode.waterBoxMode == WaterBoxMode.OFF) WaterBoxMode.LOW else mode.waterBoxMode
+                            update(mode.copy(fanPower = fan, waterBoxMode = water))
+                        }
+                        ModeOptionSelector("Water flow", WATER_OPTIONS.map { it.second }, WATER_OPTIONS.indexOfFirst { it.first == WaterBoxMode.normalize(mode.waterBoxMode) }, !busy) {
+                            val water = WATER_OPTIONS[it].first
+                            val fan = if (water == WaterBoxMode.OFF && mode.fanPower == VacuumFanPower.OFF) VacuumFanPower.BALANCED else mode.fanPower
+                            update(mode.copy(fanPower = fan, waterBoxMode = water))
+                        }
+                        if (mode.waterBoxMode != WaterBoxMode.OFF) {
+                            ModeOptionSelector("Route", ROUTE_OPTIONS.map { it.second }, ROUTE_OPTIONS.indexOfFirst { it.first == mode.mopMode }, !busy) {
+                                update(mode.copy(mopMode = ROUTE_OPTIONS[it].first))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (rooms.isNotEmpty()) {
+            Button(onClick = { onSave(draft) }, enabled = !busy && unsaved, modifier = Modifier.fillMaxWidth()) {
+                Text("Save room settings")
             }
         }
     }
@@ -1498,6 +1679,7 @@ private fun RoomsSheetContent(
     onRoomToggle: (Int) -> Unit,
     onCleanRooms: () -> Unit,
     onLoadMap: () -> Unit,
+    onDefaultOrder: () -> Unit,
 ) {
     Column(
         modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp).navigationBarsPadding().padding(bottom = 16.dp),
@@ -1544,6 +1726,85 @@ private fun RoomsSheetContent(
                 Spacer(Modifier.width(8.dp))
                 Text("Clean selected rooms")
             }
+            TextButton(onClick = onDefaultOrder, enabled = !busy, modifier = Modifier.fillMaxWidth()) {
+                Text("Default cleaning order")
+            }
+        }
+    }
+}
+
+/**
+ * The order a full clean goes through the rooms in. Starts from the saved order, with rooms it
+ * does not name added at the end; arrows move a room up or down.
+ */
+@Composable
+private fun CleanOrderSheetContent(
+    rooms: List<ParsedMapRoom>,
+    savedOrder: List<Int>,
+    busy: Boolean,
+    onSave: (List<Int>) -> Unit,
+    onRemove: () -> Unit,
+) {
+    val initial = remember(rooms, savedOrder) {
+        val onMap = rooms.map { it.id }
+        (savedOrder.filter { it in onMap } + onMap).distinct()
+    }
+    var order by remember(initial) { mutableStateOf(initial) }
+    val names = remember(rooms) { rooms.associate { it.id to it.name } }
+    fun move(from: Int, to: Int) {
+        order = order.toMutableList().apply { add(to, removeAt(from)) }
+    }
+
+    Column(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp).navigationBarsPadding().padding(bottom = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp),
+    ) {
+        Text("Default cleaning order", style = MaterialTheme.typography.headlineSmall)
+        Text(
+            if (rooms.isEmpty()) "Load the map first to discover your rooms."
+            else "Clean without picking rooms goes through them in this order. Rooms you pick are still cleaned in the order you tap them.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Column(Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState())) {
+            order.forEachIndexed { index, roomId ->
+                if (index > 0) HorizontalDivider()
+                Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Surface(shape = CircleShape, color = MaterialTheme.colorScheme.primary, modifier = Modifier.size(24.dp)) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Text("${index + 1}", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onPrimary)
+                        }
+                    }
+                    Text(
+                        names[roomId] ?: "Room $roomId",
+                        modifier = Modifier.weight(1f).padding(horizontal = 12.dp),
+                        style = MaterialTheme.typography.bodyMedium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    IconButton(onClick = { move(index, index - 1) }, enabled = !busy && index > 0) {
+                        Icon(Icons.Default.KeyboardArrowUp, contentDescription = "Move ${names[roomId] ?: "room"} up")
+                    }
+                    IconButton(onClick = { move(index, index + 1) }, enabled = !busy && index < order.lastIndex) {
+                        Icon(Icons.Default.KeyboardArrowDown, contentDescription = "Move ${names[roomId] ?: "room"} down")
+                    }
+                }
+            }
+        }
+        if (rooms.isNotEmpty()) {
+            Button(
+                onClick = { onSave(order) },
+                enabled = !busy && order != savedOrder,
+                modifier = Modifier.fillMaxWidth().height(56.dp),
+                shape = MaterialTheme.shapes.extraLarge,
+            ) {
+                Text("Save order")
+            }
+        }
+        if (savedOrder.isNotEmpty()) {
+            TextButton(onClick = onRemove, enabled = !busy, modifier = Modifier.fillMaxWidth()) {
+                Text("Remove default order")
+            }
         }
     }
 }
@@ -1558,10 +1819,12 @@ private fun MapsSheetContent(
     blockedReason: String?,
     canAddMap: Boolean,
     unsavedMap: Boolean,
+    mapSaving: Boolean?,
     multiLevel: Boolean?,
     smartSwitching: Boolean?,
     onMultiLevelChange: (Boolean) -> Unit,
     onSmartSwitchingChange: (Boolean) -> Unit,
+    onEnableMapSaving: () -> Unit,
     onLoad: (Int) -> Unit,
     onRename: (FloorMap) -> Unit,
     onDelete: (FloorMap) -> Unit,
@@ -1584,6 +1847,23 @@ private fun MapsSheetContent(
             Text(blockedReason, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error)
         }
         val canManage = !busy && !loading && blockedReason == null
+
+        // A robot that holds saved maps keeps maps, whatever its status says.
+        if (mapSaving == false && floorMaps.isEmpty() && !loading) {
+            Surface(shape = MaterialTheme.shapes.large, color = MaterialTheme.colorScheme.surfaceContainerHigh) {
+                Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Map saving is off", style = MaterialTheme.typography.titleSmall)
+                    Text(
+                        "This robot does not keep a map yet, so there are no rooms, zones or floors to work with. " +
+                            "Turn map saving on to let it store one.",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    OutlinedButton(onClick = onEnableMapSaving, enabled = canManage, modifier = Modifier.fillMaxWidth()) {
+                        Text("Turn on map saving")
+                    }
+                }
+            }
+        }
 
         if (multiLevel != null) {
             SettingSwitchRow(
@@ -1804,34 +2084,8 @@ private fun batteryColor(battery: Int?): Color = when {
 }
 
 @Composable
-private fun stateLabel(state: Int?): String = when (state) {
-    null -> "—"
-    VacuumStateCodes.STARTING -> "Starting"
-    VacuumStateCodes.CHARGER_DISCONNECTED -> "Charger disconnected"
-    VacuumStateCodes.IDLE -> "Idle"
-    VacuumStateCodes.REMOTE_CONTROL_ACTIVE -> "Remote control"
-    VacuumStateCodes.CLEANING -> "Cleaning"
-    VacuumStateCodes.RETURNING_HOME -> "Returning home"
-    VacuumStateCodes.MANUAL_MODE -> "Manual mode"
-    VacuumStateCodes.CHARGING -> "Charging"
-    VacuumStateCodes.CHARGING_ERROR -> "Charging error"
-    VacuumStateCodes.PAUSED -> "Paused"
-    VacuumStateCodes.SPOT_CLEANING -> "Spot cleaning"
-    VacuumStateCodes.ERROR -> "Error"
-    VacuumStateCodes.SHUTTING_DOWN -> "Shutting down"
-    VacuumStateCodes.UPDATING -> "Updating"
-    VacuumStateCodes.DOCKING -> "Docking"
-    VacuumStateCodes.GOING_TO_TARGET -> "Going to target"
-    VacuumStateCodes.ZONED_CLEANING -> "Zoned cleaning"
-    VacuumStateCodes.SEGMENT_CLEANING -> "Room cleaning"
-    VacuumStateCodes.MAPPING -> "Mapping"
-    VacuumStateCodes.NOT_CHARGING -> "Idle"
-    VacuumStateCodes.WASHING_MOP -> "Washing mop"
-    VacuumStateCodes.GOING_TO_WASH_MOP -> "Going to wash mop"
-    VacuumStateCodes.DRYING_MOP -> "Drying mop"
-    VacuumStateCodes.RETURNING_TO_DOCK_FOR_DRYING -> "Returning to dock"
-    else -> "State $state"
-}
+private fun stateLabel(state: Int?): String =
+    if (state == null) "—" else VacuumStateCodes.describe(state)
 
 private fun dryingLabel(remainingDrySec: Long?): String {
     val left = remainingDrySec?.takeIf { it > 0 }?.let { s ->

@@ -64,6 +64,18 @@ fun AppNavHost() {
         }
     }
 
+    // A tapped notification names a robot. Go there once the app is past its first screens and
+    // the list that robot lives in is loaded, replacing whatever was open above the list.
+    val pendingOpen by container.pendingOpenDuid.collectAsState()
+    val devices by container.deviceRepository.devices.collectAsState()
+    LaunchedEffect(splashDone, userData, pendingOpen, devices) {
+        val duid = pendingOpen ?: return@LaunchedEffect
+        if (!splashDone || userData == null) return@LaunchedEffect
+        if (devices.none { it.duid == duid && it.localKey != null }) return@LaunchedEffect
+        container.consumePendingOpen()
+        navController.navigate(VacuumGraph(duid)) { popUpTo<DeviceList>() }
+    }
+
     NavHost(navController = navController, startDestination = Splash) {
 
         composable<Splash> {

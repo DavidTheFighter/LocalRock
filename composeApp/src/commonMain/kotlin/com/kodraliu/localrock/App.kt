@@ -45,8 +45,12 @@ fun App(container: AppContainer) {
     val scope = rememberCoroutineScope()
     DisposableEffect(lifecycleOwner, container) {
         val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_STOP) container.setForeground(false)
             if (event == Lifecycle.Event.ON_START) {
+                container.setForeground(true)
                 scope.launch { container.onEnterForeground() }
+                // A robot can drop off while the app is away, and the list is not reloaded on return.
+                container.deviceRepository.probeReachability()
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)

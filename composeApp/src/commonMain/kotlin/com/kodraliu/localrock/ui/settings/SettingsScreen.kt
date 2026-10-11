@@ -3,6 +3,7 @@ package com.kodraliu.localrock.ui.settings
 import com.kodraliu.localrock.ui.exceptBottom
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -26,6 +27,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -35,18 +37,21 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import com.kodraliu.localrock.shared.notify.backgroundAlertsSupported
 import com.kodraliu.localrock.shared.settings.ThemeMode
 import com.kodraliu.localrock.shared.platform.donationUrl
 import com.kodraliu.localrock.shared.platform.donationsEnabled
 import com.kodraliu.localrock.ui.LocalAppContainer
+import com.kodraliu.localrock.ui.rememberNotificationPermissionRequest
 import com.kodraliu.localrock.ui.whatsnew.WhatsNewSheet
 import com.kodraliu.localrock.ui.whatsnew.whatsNewFor
 
-const val APP_VERSION: String = "1.2.0"
+const val APP_VERSION: String = "1.3.0"
 
 private const val PROJECT_URL = "https://github.com/DonSidro/LocalRock/"
 
@@ -143,6 +148,12 @@ fun SettingsScreen(onDone: () -> Unit, allowCancel: Boolean) {
                 ) { Text("Explore the demo (no server needed)") }
             }
 
+            // Alerts are about robots, and there are none to watch before signing in.
+            if (userData != null) {
+                HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+                NotificationSettings()
+            }
+
             HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
 
             SectionLabel("Contribute")
@@ -222,6 +233,94 @@ fun SettingsScreen(onDone: () -> Unit, allowCancel: Boolean) {
 
     if (showWhatsNew && whatsNew != null) {
         WhatsNewSheet(release = whatsNew, onDismiss = { showWhatsNew = false })
+    }
+}
+
+@Composable
+private fun NotificationSettings() {
+    val container = LocalAppContainer.current
+    val settings = container.appSettings
+    val enabled by settings.notifyEnabled.collectAsState()
+    val errors by settings.notifyErrors.collectAsState()
+    val finished by settings.notifyFinished.collectAsState()
+    val dock by settings.notifyDock.collectAsState()
+    val background by settings.notifyBackground.collectAsState()
+    val progress by settings.notifyProgress.collectAsState()
+    val requestPermission = rememberNotificationPermissionRequest { granted ->
+        if (granted) {
+            settings.setNotifyEnabled(true)
+        } else {
+            container.messages.warn("Allow notifications for LocalRock in your phone's settings to get robot alerts.")
+        }
+    }
+
+    SectionLabel("Notifications")
+    SwitchRow(
+        title = "Robot alerts",
+        description = "Tells you when a robot gets stuck, finishes cleaning, or its dock needs attention.",
+        checked = enabled,
+        onCheckedChange = { on -> if (on) requestPermission() else settings.setNotifyEnabled(false) },
+    )
+    if (!enabled) return
+    SwitchRow("Errors and stuck robot", null, errors, settings::setNotifyErrors)
+    SwitchRow("Cleaning finished", null, finished, settings::setNotifyFinished)
+    SwitchRow(
+        title = "Dock needs attention",
+        description = "Clean water empty, dirty water full, dust bag missing.",
+        checked = dock,
+        onCheckedChange = settings::setNotifyDock,
+    )
+    if (backgroundAlertsSupported) {
+        SwitchRow(
+            title = "Keep watching in the background",
+            description = "Keeps the connection to your server open so alerts arrive while the app is " +
+                "closed. Android shows one permanent notification while this is on.",
+            checked = background,
+            onCheckedChange = settings::setNotifyBackground,
+        )
+        // Progress needs the background watch: without it nothing keeps the notification moving.
+        if (background) {
+            SwitchRow(
+                title = "Show cleaning progress",
+                description = "While a clean runs, the background notification shows what the " +
+                    "robot is doing, which room it is in, and how far along it is.",
+                checked = progress,
+                onCheckedChange = settings::setNotifyProgress,
+            )
+        }
+    }
+    Text(
+        if (backgroundAlertsSupported) {
+            "Alerts come straight from your own server, so they only arrive while your phone can " +
+                "reach it: on your home Wi-Fi or through your VPN."
+        } else {
+            "Alerts arrive while LocalRock is open. iOS does not let an app keep a connection to " +
+                "your own server open in the background, and LocalRock does not send anything " +
+                "through Apple's push service."
+        },
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+}
+
+@Composable
+private fun SwitchRow(title: String, description: String?, checked: Boolean, onCheckedChange: (Boolean) -> Unit) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(16.dp),
+    ) {
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text(title, style = MaterialTheme.typography.bodyLarge)
+            if (description != null) {
+                Text(
+                    description,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        Switch(checked = checked, onCheckedChange = onCheckedChange)
     }
 }
 

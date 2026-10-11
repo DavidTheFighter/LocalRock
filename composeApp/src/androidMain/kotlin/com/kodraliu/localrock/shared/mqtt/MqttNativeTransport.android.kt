@@ -1,28 +1,25 @@
-@file:OptIn(ExperimentalUnsignedTypes::class)
-
 package com.kodraliu.localrock.shared.mqtt
 
-import io.github.davidepianca98.MQTTClient
-import io.github.davidepianca98.mqtt.MQTTVersion
-import io.github.davidepianca98.mqtt.Subscription
-import io.github.davidepianca98.mqtt.packets.Qos
-import io.github.davidepianca98.mqtt.packets.mqttv5.ReasonCode
-import io.github.davidepianca98.mqtt.packets.mqttv5.SubscriptionOptions
-import io.github.davidepianca98.socket.tls.TLSClientSettings
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
-import kotlinx.coroutines.launch
+import org.eclipse.paho.client.mqttv3.IMqttActionListener
+import org.eclipse.paho.client.mqttv3.IMqttDeliveryToken
+import org.eclipse.paho.client.mqttv3.IMqttToken
+import org.eclipse.paho.client.mqttv3.MqttAsyncClient
+import org.eclipse.paho.client.mqttv3.MqttCallback
+import org.eclipse.paho.client.mqttv3.MqttConnectOptions
+import org.eclipse.paho.client.mqttv3.MqttMessage
+import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence
 import java.util.concurrent.atomic.AtomicBoolean
 
-/** Android MQTT transport backed by KMQTT (JVM TLS via the platform trust store). */
-actual fun defaultMqttTransport(): MqttNativeTransport? = KmqttTransport()
+/**
+ * Android MQTT transport backed by Eclipse Paho (TLS via the platform trust store).
+ *
+ * Paho names the server in the TLS handshake (SNI) and checks that the certificate belongs to
+ * that name. KMQTT 1.0.0, used before, did neither: a reverse proxy that picks its certificate by
+ * server name had nothing to go on and dropped the connection (issue #18).
+ */
+actual fun defaultMqttTransport(): MqttNativeTransport? = PahoTransport()
 
-private class KmqttTransport : MqttNativeTransport {
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+internal class PahoTransport : MqttNativeTransport {
 
     override fun open(
         host: String,
@@ -38,66 +35,74 @@ private class KmqttTransport : MqttNativeTransport {
         onDisconnected: () -> Unit,
     ): MqttNativeConnection {
         val dropped = AtomicBoolean(false)
-        val fireDisconnected = { if (dropped.compareAndSet(false, true)) onDisconnected() }
-
-        val tlsSettings = if (tls) TLSClientSettings(serverCertificate = null) else null
-        val client = MQTTClient(
-            mqttVersion = MQTTVersion.MQTT3_1_1,
-            address = host,
-            port = port,
-            tls = tlsSettings,
-            keepAlive = keepAliveSeconds,
-            userName = username,
-            password = password.encodeToByteArray().toUByteArray(),
-            clientId = clientId,
-            onConnected = { onConnected() },
-            onDisconnected = { fireDisconnected() },
-            publishReceived = { publish ->
-                onMessage(publish.topicName, publish.payload?.toByteArray() ?: ByteArray(0))
-            },
-        )
-        client.runSuspend(Dispatchers.Default)
-
-
-        val watchdog = scope.launch {
-            while (isActive) {
-                if (!client.isRunning()) {
-                    fireDisconnected()
-                    break
-                }
-                delay(2_000L)
+        val scheme = if (tls) "ssl" else "tcp"
+        val client = MqttAsyncClient("$scheme://$host:$port", clientId, MemoryPersistence())
+        client.setCallback(object : MqttCallback {
+            override fun connectionLost(cause: Throwable?) {
+                if (dropped.compareAndSet(false, true)) onDisconnected()
             }
+
+            override fun messageArrived(topic: String, message: MqttMessage) {
+                onMessage(topic, message.payload ?: ByteArray(0))
+            }
+
+            override fun deliveryComplete(token: IMqttDeliveryToken?) = Unit
+        })
+        val options = MqttConnectOptions().apply {
+            mqttVersion = MqttConnectOptions.MQTT_VERSION_3_1_1
+            isCleanSession = true
+            // MqttClient owns reconnecting, with fresh credentials when the old ones expire.
+            isAutomaticReconnect = false
+            keepAliveInterval = keepAliveSeconds
+            connectionTimeout = CONNECT_TIMEOUT_SECONDS
+            maxInflight = MAX_INFLIGHT
+            userName = username
+            setPassword(password.toCharArray())
         }
-        return KmqttConnection(client, watchdog)
+        client.connect(options, null, object : IMqttActionListener {
+            override fun onSuccess(asyncActionToken: IMqttToken?) = onConnected()
+
+            override fun onFailure(asyncActionToken: IMqttToken?, exception: Throwable?) {
+                onFailed(describe(exception))
+            }
+        })
+        return PahoConnection(client)
+    }
+
+    /** Paho wraps the real cause (a TLS or socket error) in an MqttException that only has a code. */
+    private fun describe(e: Throwable?): String {
+        val cause = e?.cause ?: e
+        return cause?.message?.takeIf { it.isNotBlank() } ?: cause?.let { it::class.simpleName } ?: "unknown error"
+    }
+
+    private companion object {
+        const val CONNECT_TIMEOUT_SECONDS = 20
+        /** Paho refuses to publish beyond this many unacknowledged messages; its default is 10. */
+        const val MAX_INFLIGHT = 100
     }
 }
 
-private class KmqttConnection(
-    private val client: MQTTClient,
-    private val watchdog: Job,
-) : MqttNativeConnection {
-    override val isConnected: Boolean get() = client.isConnackReceived()
+private class PahoConnection(private val client: MqttAsyncClient) : MqttNativeConnection {
+    override val isConnected: Boolean get() = client.isConnected
 
     override fun subscribe(topic: String, qos: Int) {
-        client.subscribe(listOf(Subscription(topic, SubscriptionOptions(qos.toQos()))))
+        client.subscribe(topic, qos)
     }
 
     override fun unsubscribe(topic: String) {
-        client.unsubscribe(listOf(topic))
+        client.unsubscribe(topic)
     }
 
     override fun publish(topic: String, payload: ByteArray, qos: Int, retain: Boolean) {
-        client.publish(retain, qos.toQos(), topic, payload.toUByteArray())
+        client.publish(topic, payload, qos, retain)
     }
 
     override fun close() {
-        watchdog.cancel()
-        runCatching { client.disconnect(ReasonCode.SUCCESS) }
+        runCatching { client.disconnectForcibly(0, DISCONNECT_TIMEOUT_MS) }
+        runCatching { client.close(true) }
     }
 
-    private fun Int.toQos(): Qos = when (this) {
-        0 -> Qos.AT_MOST_ONCE
-        2 -> Qos.EXACTLY_ONCE
-        else -> Qos.AT_LEAST_ONCE
+    private companion object {
+        const val DISCONNECT_TIMEOUT_MS = 1_000L
     }
 }
