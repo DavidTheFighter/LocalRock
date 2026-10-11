@@ -170,6 +170,7 @@ class CameraLiveSession(private val session: VacuumSession) {
                         "setting is lost when the robot is moved back to a local server."
                 )
             }
+            if (errorCode(startResp.error) == ERR_TURN_SERVER_FAILED) throw IllegalStateException(TURN_SERVER_HINT)
             throw IllegalStateException("Robot refused camera preview: ${startResp.error}")
         }
 
@@ -290,8 +291,24 @@ class CameraLiveSession(private val session: VacuumSession) {
          * cloud enables it. **Bit 2 (0x4) is the authorization and is write-protected** —
          * `set_camera_status` rejects any value containing it with -10005, while bits 5, 7 and 13
          * write fine and do not unblock the preview. No RPC on this firmware sets `home_sec_status`.
+         *
+         * Tried 2026-10-10 after a Saros 10R owner described a "two-key" activation
+         * (local_roborock_server issue #18, no bit values given): from 385, writing 8609 (bits 5
+         * and 13 added) was accepted and kept, but pressing Power on the robot within 80 s set
+         * neither bit 2 nor `home_sec_status` / `monitor_status`. The value was put back to 385.
          */
         const val CAMERA_STATUS_OFF = 259
+
+        /**
+         * Robot error for "request turnserver failed": before streaming the robot asks its server
+         * for a relay and got no answer (seen on an S7 MaxV, local_roborock_server discussion #140).
+         */
+        const val ERR_TURN_SERVER_FAILED = -10014
+
+        const val TURN_SERVER_HINT =
+            "The robot couldn't get a video relay from the server (-10014). The camera needs a local " +
+                "server with camera (TURN) support set up, and the robot paired so that it can find it. " +
+                "See the server's camera documentation."
 
         /** `client_id` the robot returns when the camera is free. */
         const val NO_CLIENT = "none"

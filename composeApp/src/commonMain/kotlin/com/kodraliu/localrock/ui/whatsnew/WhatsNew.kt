@@ -12,10 +12,14 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.Map
+import androidx.compose.material.icons.filled.Notifications
+import androidx.compose.material.icons.filled.Reorder
+import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -42,6 +46,43 @@ data class WhatsNewRelease(val version: String, val items: List<WhatsNewItem>)
 
 /** Newest first. */
 val WHATS_NEW: List<WhatsNewRelease> = listOf(
+    WhatsNewRelease(
+        version = "1.3.0",
+        items = listOf(
+            WhatsNewItem(
+                Icons.Default.Tune,
+                "Settings per room",
+                "Choose Per room in the cleaning mode to give every room its own suction, water " +
+                    "and route, for example mopping the kitchen and only vacuuming the bedroom.",
+            ),
+            WhatsNewItem(
+                Icons.Default.Reorder,
+                "Cleaning order",
+                "Rooms you pick are cleaned in the order you tap them. More > Rooms > Default " +
+                    "cleaning order sets the order for a clean without picked rooms.",
+            ),
+            WhatsNewItem(
+                Icons.Default.AutoAwesome,
+                "SmartPlan",
+                "On robots that have it, SmartPlan lets the robot choose suction, water and " +
+                    "route for each room.",
+            ),
+            WhatsNewItem(
+                Icons.Default.Notifications,
+                "Robot alerts",
+                "Settings > Notifications can tell you when a robot gets stuck, finishes " +
+                    "cleaning, or its dock needs attention.",
+            ),
+            WhatsNewItem(
+                Icons.Default.Build,
+                "Fixes",
+                "The app connects faster when it starts and after the screen was off, and no " +
+                    "longer shows a robot as online when it is not. Map editing and map " +
+                    "switching work on older robots, and a robot that never used the official " +
+                    "app can save its first map.",
+            ),
+        ),
+    ),
     WhatsNewRelease(
         version = "1.2.0",
         items = listOf(

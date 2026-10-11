@@ -160,22 +160,19 @@ private class AddVacuumModel(
 
                 // 3. Poll the session until the vacuum reports in.
                 _serverStatus.value = "Wi-Fi sent. Waiting for the vacuum to reach the server…"
-                val guidance = session.guidance?.takeIf { it.isNotBlank() }?.let { " $it" } ?: ""
                 when (val outcome = pollSession(sessionId)) {
                     PairOutcome.Complete -> _result.value =
                         "Vacuum connected and its public key was recovered. " +
                             "It should now appear in your device list."
-                    PairOutcome.ConnectedNoKey -> _error.value =
+                    is PairOutcome.ConnectedNoKey -> _error.value =
                         "The vacuum reached the server, but its public key was never recovered, so " +
                             "it will appear in the list with no data. Factory-reset the vacuum and " +
-                            "run onboarding again, keeping it next to the dock.$guidance"
+                            "run onboarding again, keeping it next to the dock." + outcome.guidance.asSuffix()
                     is PairOutcome.Conflict -> _error.value =
                         "The server reported an identity conflict — this vacuum is already registered " +
                             "under different credentials. Remove it on the server, then retry." +
-                            (outcome.guidance?.takeIf { it.isNotBlank() }?.let { " $it" } ?: "")
-                    PairOutcome.TimedOut -> _result.value =
-                        "Wi-Fi was sent, but the vacuum hasn't reported to the server within the wait window. " +
-                            "Keep it powered near the dock — it can take a few minutes, then re-check the device list.$guidance"
+                            outcome.guidance.asSuffix()
+                    is PairOutcome.TimedOut -> _result.value = timedOutText(outcome)
                 }
             } catch (e: Throwable) {
                 _error.value = describe(e)
@@ -205,8 +202,32 @@ private class AddVacuumModel(
             }
             delay(POLL_INTERVAL_MS)
         }
-        return if (last?.connected == true) PairOutcome.ConnectedNoKey else PairOutcome.TimedOut
+        return if (last?.connected == true) {
+            PairOutcome.ConnectedNoKey(last?.guidance)
+        } else {
+            PairOutcome.TimedOut(last?.querySamples ?: 0, last?.hasPublicKey == true, last?.guidance)
+        }
     }
+
+    /**
+     * What to do next depends on how far the vacuum got. Reports from several models agree that
+     * pairing takes two or three rounds: one or two until the server has the public key, then one
+     * more for the vacuum to connect.
+     */
+    private fun timedOutText(outcome: PairOutcome.TimedOut): String = when {
+        outcome.hasPublicKey ->
+            "The server has the vacuum's public key, but the vacuum is not connected yet. " +
+                "Run Add vacuum once more to finish."
+        outcome.samples > 0 ->
+            "The vacuum reached the server, which does not have its public key yet. " +
+                "That usually takes two or three rounds: run Add vacuum again."
+        else ->
+            "Wi-Fi was sent, but the vacuum hasn't reported to the server within the wait window. " +
+                "Keep it powered near the dock, it can take a few minutes. If it never shows up, check that " +
+                "the vacuum can reach the server from its network. Some older models also reject the " +
+                "server's certificate without any error and need one from another authority " +
+                "(see the server's tested vacuums list)."
+    } + outcome.guidance.asSuffix()
 
     private companion object {
         const val POLL_INTERVAL_MS = 5_000L
@@ -219,12 +240,14 @@ private sealed interface PairOutcome {
     /** Connected and the public key was recovered — the vacuum is usable. */
     data object Complete : PairOutcome
     /** Reached the server, but no public key: it will show up with no data. */
-    data object ConnectedNoKey : PairOutcome
+    data class ConnectedNoKey(val guidance: String?) : PairOutcome
     /** Server reports the vacuum is already registered under other credentials. */
     data class Conflict(val guidance: String?) : PairOutcome
-    /** Never reported in within the wait window. */
-    data object TimedOut : PairOutcome
+    /** Not connected within the wait window; [samples] and [hasPublicKey] say how far it got. */
+    data class TimedOut(val samples: Int, val hasPublicKey: Boolean, val guidance: String?) : PairOutcome
 }
+
+private fun String?.asSuffix(): String = this?.takeIf { it.isNotBlank() }?.let { " $it" } ?: ""
 
 private fun describe(e: Throwable): String = "${e::class.simpleName}: ${e.message ?: "Unknown error"}"
 

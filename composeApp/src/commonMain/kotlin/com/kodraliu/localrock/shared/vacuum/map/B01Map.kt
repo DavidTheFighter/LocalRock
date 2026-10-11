@@ -252,6 +252,16 @@ data class ParsedMapPoint(
 class MapParseException(message: String) : RuntimeException(message)
 
 
+/** The room under a point given in robot coordinates (mm), or null when it is on no room's floor. */
+fun ParsedMap.roomAtMm(point: ParsedMapPoint): ParsedMapRoom? {
+    // One grid cell is 50 mm, and grid rows count up from the bottom of the rendered map.
+    // floor, not toInt: a point just left of or below the map must not round into its first cell.
+    val col = kotlin.math.floor(point.x / 50f - pixelOffsetLeft).toInt()
+    val row = kotlin.math.floor(point.y / 50f - pixelOffsetTop).toInt()
+    if (col !in 0 until width || row !in 0 until height) return null
+    return roomAtNorm((col + 0.5f) / width, 1f - (row + 0.5f) / height)
+}
+
 fun ParsedMap.roomAtNorm(normX: Float, normY: Float): ParsedMapRoom? {
     if (rooms.isEmpty()) return null
     val col = (normX * width).toInt().coerceIn(0, width - 1)

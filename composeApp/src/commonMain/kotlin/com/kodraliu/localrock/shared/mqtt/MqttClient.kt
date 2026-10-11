@@ -6,7 +6,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -17,6 +17,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.concurrent.Volatile
 import kotlin.coroutines.coroutineContext
 import kotlin.time.TimeMark
@@ -40,6 +41,13 @@ class MqttClient(private val transport: MqttNativeTransport) {
     val connected: StateFlow<Boolean> = _connected
 
     private val mutex = Mutex()
+
+    /**
+     * One socket operation at a time. Several sessions share this connection and call in from
+     * different threads, and the transport underneath makes no promise about that. The link was
+     * seen to drop right after two sessions subscribed and published at the same moment.
+     */
+    private val ioMutex = Mutex()
     private var conn: MqttNativeConnection? = null
     private var superviseJob: Job? = null
     private var closed = false
@@ -65,7 +73,16 @@ class MqttClient(private val transport: MqttNativeTransport) {
 
     private var currentDisconnect: CompletableDeferred<Unit>? = null
 
-    private val subscriptions = mutableMapOf<String, Int>()
+    /** Cuts the wait between connect attempts short, see [retryNow]. */
+    private val retrySignal = Channel<Unit>(Channel.CONFLATED)
+
+    /**
+     * Counted per topic: more than one session can listen to the same robot (the detail screen and
+     * a reachability probe), and one of them leaving must not silence the other.
+     */
+    private class Subscription(val qos: Int, var holders: Int)
+
+    private val subscriptions = mutableMapOf<String, Subscription>()
 
     private data class Params(
         val creds: MqttCreds,
@@ -75,41 +92,47 @@ class MqttClient(private val transport: MqttNativeTransport) {
     )
 
 
-    suspend fun connect(
+    /**
+     * Start the connection supervisor if it is not running, and return without waiting for the
+     * broker. The supervisor keeps trying until [disconnect], the first attempt included: right
+     * after an app start the network is often not up yet, and giving up there left the app offline
+     * until the vacuum screen was opened again (issue #20). Watch [connected] for the outcome.
+     */
+    suspend fun start(
         creds: MqttCreds,
         clientId: String,
         connectTimeoutMs: Long = 15_000L,
         keepAliveSeconds: Int = 30,
     ) {
         mutex.withLock {
-            check(superviseJob == null) { "Already connected" }
+            if (superviseJob != null) return
             closed = false
             params = Params(creds, clientId, keepAliveSeconds, connectTimeoutMs)
+            superviseJob = scope.launch { superviseLoop() }
         }
-        val firstConnect = CompletableDeferred<Unit>()
-        val job = scope.launch { superviseLoop(firstConnect) }
-        mutex.withLock { superviseJob = job }
-        try {
-            firstConnect.await()
-        } catch (e: Throwable) {
-            job.cancel()
-            mutex.withLock {
-                superviseJob = null
-                conn = null
-            }
-            throw e
-        }
+    }
+
+    /**
+     * Try to connect now instead of sitting out the rest of the backoff, which grows to 30 s.
+     * For moments when the network has probably just come back, like the app returning to the
+     * foreground. Does nothing while connected.
+     */
+    fun retryNow() {
+        if (!_connected.value) retrySignal.trySend(Unit)
     }
 
 
     suspend fun subscribe(topic: String, qos: Int = QOS_AT_LEAST_ONCE) {
         val c = mutex.withLock {
-            subscriptions[topic] = qos
+            val existing = subscriptions[topic]
+            if (existing != null) existing.holders++ else subscriptions[topic] = Subscription(qos, holders = 1)
             conn
         }
+        // Sent even when another holder already subscribed: it is idempotent on the broker, and it
+        // repairs a first attempt that failed.
         if (c != null && c.isConnected) {
             withContext(Dispatchers.Default) {
-                runCatching { c.subscribe(topic, qos) }
+                runCatching { ioMutex.withLock { c.subscribe(topic, qos) } }
                     .onFailure { println("[VacLocal] MQTT subscribe $topic failed (will retry on reconnect): ${it.message}") }
             }
         }
@@ -117,11 +140,13 @@ class MqttClient(private val transport: MqttNativeTransport) {
 
     suspend fun unsubscribe(topic: String) {
         val c = mutex.withLock {
+            val existing = subscriptions[topic] ?: return
+            if (--existing.holders > 0) return
             subscriptions.remove(topic)
             conn
         }
         if (c != null && c.isConnected) {
-            withContext(Dispatchers.Default) { runCatching { c.unsubscribe(topic) } }
+            withContext(Dispatchers.Default) { runCatching { ioMutex.withLock { c.unsubscribe(topic) } } }
         }
     }
 
@@ -130,7 +155,9 @@ class MqttClient(private val transport: MqttNativeTransport) {
         if (c == null || !c.isConnected) throw MqttClientException("MQTT not connected (reconnecting)")
         withContext(Dispatchers.Default) {
             try {
-                c.publish(topic, payload, qos, retain)
+                ioMutex.withLock { c.publish(topic, payload, qos, retain) }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Throwable) {
                 throw MqttClientException("MQTT publish failed: ${e.message}", e)
             }
@@ -164,9 +191,8 @@ class MqttClient(private val transport: MqttNativeTransport) {
         _connected.value = false
     }
 
-    private suspend fun superviseLoop(firstConnect: CompletableDeferred<Unit>) {
+    private suspend fun superviseLoop() {
         var backoffMs = INITIAL_BACKOFF_MS
-        var firstAttempt = true
         var failedAttempts = 0
         while (coroutineContext.isActive && !isClosed()) {
             // Re-read every iteration: credentials can be swapped out between attempts, and the
@@ -214,10 +240,6 @@ class MqttClient(private val transport: MqttNativeTransport) {
                 failedAttempts = 0
                 println("[VacLocal] MQTT connected host=${p.creds.host}:${p.creds.port} user=${p.creds.username}")
                 resubscribeAll(c)
-                if (firstAttempt) {
-                    firstConnect.complete(Unit)
-                    firstAttempt = false
-                }
 
                 disconnected.await()
                 _connected.value = false
@@ -227,13 +249,7 @@ class MqttClient(private val transport: MqttNativeTransport) {
             } catch (e: Throwable) {
                 _connected.value = false
                 failedAttempts++
-                println("[VacLocal] MQTT connect attempt failed (#$failedAttempts): ${e::class.simpleName}: ${e.message}")
-                if (firstAttempt) {
-                    firstConnect.completeExceptionally(
-                        MqttClientException("MQTT connect failed (host=${p.creds.host}:${p.creds.port}): ${e.message}", e)
-                    )
-                    return // finally still runs cleanup
-                }
+                println("[VacLocal] MQTT connect attempt failed (#$failedAttempts) host=${p.creds.host}:${p.creds.port}: ${e::class.simpleName}: ${e.message}")
                 // The server mints a fresh session per login and rejects credentials from an
                 // expired one, so repeated failures are more likely stale creds than a dead network.
                 if (failedAttempts >= RELOGIN_AFTER_ATTEMPTS) {
@@ -257,16 +273,18 @@ class MqttClient(private val transport: MqttNativeTransport) {
             }
 
             if (isClosed()) break
-            delay(backoffMs)
-            backoffMs = (backoffMs * 2).coerceAtMost(MAX_BACKOFF_MS)
+            // A signal left over from before this attempt must not skip the wait.
+            retrySignal.tryReceive()
+            val hurried = withTimeoutOrNull(backoffMs) { retrySignal.receive() } != null
+            backoffMs = if (hurried) INITIAL_BACKOFF_MS else (backoffMs * 2).coerceAtMost(MAX_BACKOFF_MS)
         }
     }
 
     private suspend fun resubscribeAll(c: MqttNativeConnection) {
-        val subs = mutex.withLock { subscriptions.toMap() }
+        val subs = mutex.withLock { subscriptions.mapValues { it.value.qos } }
         if (subs.isEmpty()) return
         for ((topic, qos) in subs) {
-            runCatching { c.subscribe(topic, qos) }
+            runCatching { ioMutex.withLock { c.subscribe(topic, qos) } }
                 .onFailure { println("[VacLocal] MQTT resubscribe $topic failed: ${it.message}") }
         }
         println("[VacLocal] MQTT (re)subscribed ${subs.size} topic(s)")
