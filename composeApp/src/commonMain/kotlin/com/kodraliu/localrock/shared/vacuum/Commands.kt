@@ -91,26 +91,41 @@ suspend fun VacuumSession.appZonedClean(zones: List<ZoneRect>): V1Response {
 
 suspend fun VacuumSession.getTimer(): V1Response = sendCommand("get_timer")
 
-suspend fun VacuumSession.setTimer(id: String, enabled: Boolean, cron: String): V1Response =
+// set_timer takes [[id, [cron, [action, data]]]]; new timers are always on. Captured on a Qrevo
+// S5V (2026-10-09): data must be a JSON object holding fan_power, water_box_mode, mop_mode, repeat
+// and segments ("0" = whole home); anything less is "Param error", and python-miio's string data
+// is "Timer format error: data should be json". Never send segments as an array: the robot stops
+// answering and restarts. upd_timer takes a flat [id, "on"|"off"].
+suspend fun VacuumSession.setTimer(
+    id: String,
+    cron: String,
+    fanPower: Int,
+    waterBoxMode: Int,
+    mopMode: Int,
+): V1Response =
     sendCommand("set_timer", listOf(JsonArray(listOf(
         JsonPrimitive(id),
         JsonArray(listOf(
-            JsonPrimitive(if (enabled) "on" else "off"),
+            JsonPrimitive(cron),
             JsonArray(listOf(
-                JsonPrimitive(cron),
-                JsonArray(listOf(JsonPrimitive("start_clean"), JsonObject(emptyMap()))),
+                JsonPrimitive("start_clean"),
+                JsonObject(mapOf(
+                    "fan_power" to JsonPrimitive(fanPower),
+                    "water_box_mode" to JsonPrimitive(waterBoxMode),
+                    "mop_mode" to JsonPrimitive(mopMode),
+                    "repeat" to JsonPrimitive(1),
+                    "segments" to JsonPrimitive("0"),
+                )),
             )),
         )),
-    ))))
+    )))).requireOk("set_timer")
 
 suspend fun VacuumSession.delTimer(id: String): V1Response =
-    sendCommand("del_timer", listOf(JsonPrimitive(id)))
+    sendCommand("del_timer", listOf(JsonPrimitive(id))).requireOk("del_timer")
 
 suspend fun VacuumSession.updTimer(id: String, enabled: Boolean): V1Response =
-    sendCommand("upd_timer", listOf(JsonArray(listOf(
-        JsonPrimitive(id),
-        JsonPrimitive(if (enabled) "on" else "off"),
-    ))))
+    sendCommand("upd_timer", listOf(JsonPrimitive(id), JsonPrimitive(if (enabled) "on" else "off")))
+        .requireOk("upd_timer")
 
 
 suspend fun VacuumSession.getSoundVolume(): V1Response = sendCommand("get_sound_volume")

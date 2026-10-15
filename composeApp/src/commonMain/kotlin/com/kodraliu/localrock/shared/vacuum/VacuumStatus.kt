@@ -15,6 +15,7 @@ data class VacuumStatus(
     @SerialName("water_box_status") val waterBoxStatus: Int? = null,
 
     @SerialName("water_box_mode") val waterBoxCustomMode: Int? = null,
+    @SerialName("mop_mode") val mopMode: Int? = null,
     @SerialName("charge_status") val chargeStatus: Int? = null,
     @SerialName("dock_error_status") val dockErrorStatus: Int? = null,
     @SerialName("dry_status") val dryStatus: Int? = null,

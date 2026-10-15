@@ -678,24 +678,29 @@ class VacuumRepository(
         _timers.value = parsed
     }
 
-    suspend fun createTimer(hour: Int, minute: Int, weekdays: Set<Int>): CleanTimer {
-        val id = nowEpochSeconds().toString()
-        val cron = buildCron(minute, hour, weekdays)
-        session.setTimer(id, enabled = true, cron = cron)
-        val timer = CleanTimer(id = id, enabled = true, hour = hour, minute = minute, weekdays = weekdays)
-        _timers.value = _timers.value + timer
-        return timer
+    /** Creates the timer on the robot and re-reads the list, so only timers it kept are shown. */
+    suspend fun createTimer(hour: Int, minute: Int, weekdays: Set<Int>) {
+        val id = (nowEpochSeconds().toLong() * 1000).toString()
+        val status = _status.value
+        session.setTimer(
+            id = id,
+            cron = buildCron(minute, hour, weekdays),
+            fanPower = status.fanPower ?: TIMER_DEFAULT_FAN_POWER,
+            waterBoxMode = status.waterBoxCustomMode ?: TIMER_DEFAULT_WATER_BOX_MODE,
+            mopMode = status.mopMode ?: TIMER_DEFAULT_MOP_MODE,
+        )
+        fetchTimers()
+        if (_timers.value.none { it.id == id }) error("The robot accepted the routine but did not save it")
     }
 
     suspend fun toggleTimer(timer: CleanTimer) {
-        val updated = timer.copy(enabled = !timer.enabled)
-        session.updTimer(timer.id, updated.enabled)
-        _timers.value = _timers.value.map { if (it.id == timer.id) updated else it }
+        session.updTimer(timer.id, !timer.enabled)
+        fetchTimers()
     }
 
     suspend fun deleteTimer(timer: CleanTimer) {
         session.delTimer(timer.id)
-        _timers.value = _timers.value.filter { it.id != timer.id }
+        fetchTimers()
     }
 
     suspend fun fetchRobotSettings() {
@@ -952,6 +957,12 @@ class VacuumRepository(
     }
 }
 
+// Fallbacks for a timer's clean settings when get_status hasn't reported them yet (Qrevo S5V
+// defaults, captured 2026-10-09).
+private const val TIMER_DEFAULT_FAN_POWER = 103
+private const val TIMER_DEFAULT_WATER_BOX_MODE = 202
+private const val TIMER_DEFAULT_MOP_MODE = 300
+
 private fun buildCron(minute: Int, hour: Int, weekdays: Set<Int>): String {
     val days = if (weekdays.isEmpty()) "*" else weekdays.sorted().joinToString(",")
     return "$minute $hour * * $days"
@@ -979,6 +990,7 @@ internal fun VacuumStatus.merge(fresh: VacuumStatus): VacuumStatus = fresh.copy(
     errorCode = fresh.errorCode ?: errorCode,
     waterBoxStatus = fresh.waterBoxStatus ?: waterBoxStatus,
     waterBoxCustomMode = fresh.waterBoxCustomMode ?: waterBoxCustomMode,
+    mopMode = fresh.mopMode ?: mopMode,
     chargeStatus = fresh.chargeStatus ?: chargeStatus,
     dockErrorStatus = fresh.dockErrorStatus ?: dockErrorStatus,
     dryStatus = fresh.dryStatus ?: dryStatus,
