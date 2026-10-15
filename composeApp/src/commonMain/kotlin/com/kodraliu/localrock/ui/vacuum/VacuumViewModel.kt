@@ -9,6 +9,7 @@ import com.kodraliu.localrock.shared.vacuum.VacuumErrorCodes
 import com.kodraliu.localrock.shared.vacuum.VacuumRepository
 import com.kodraliu.localrock.shared.vacuum.isSmartPlanSupported
 import com.kodraliu.localrock.shared.vacuum.isWaterSlideSupported
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -67,13 +68,18 @@ class VacuumViewModel(
             try {
                 container.ensureMqttConnected()
                 repository.attach()
-                runCatching { repository.fetchConsumableStatus() }
             } catch (e: Throwable) {
                 container.messages.error(describe(e))
             } finally {
                 _busy.value = false
             }
-            launch { runCatching { repository.rooms() } }
+            // One-shot reads: the link may still be coming up, so wait for it rather than let
+            // them fail and leave the consumables and room names empty.
+            launch {
+                container.awaitMqttConnected()
+                runCatching { repository.fetchConsumableStatus() }
+                runCatching { repository.rooms() }
+            }
         }
 
         viewModelScope.launch {
@@ -124,6 +130,21 @@ class VacuumViewModel(
         repository.assignRoom(segment, room.id)
         container.deviceRepository.refresh()
         repository.setHomeRooms(container.deviceRepository.home.value?.rooms ?: emptyList())
+    }
+
+    /** The room order a full clean follows on the loaded map; empty when none has been set. */
+    fun defaultCleanOrder(): List<Int> =
+        container.appSettings.cleanOrder(device.duid, repository.currentFloorFlag.value)
+
+    /** Kept only once the robot has taken the order, so the app never remembers one it refused. */
+    fun saveDefaultCleanOrder(order: List<Int>) = run("Cleaning order saved") {
+        it.saveCleanSequence(order)
+        container.appSettings.setCleanOrder(device.duid, it.currentFloorFlag.value, order)
+    }
+
+    fun removeDefaultCleanOrder() {
+        container.appSettings.setCleanOrder(device.duid, repository.currentFloorFlag.value, emptyList())
+        container.messages.success("Default order removed")
     }
 
     fun run(successMessage: String? = null, action: suspend (VacuumRepository) -> Unit) {
@@ -178,10 +199,13 @@ private fun describe(e: Throwable): String {
     val parts = mutableListOf<String>()
     var current: Throwable? = e
     while (current != null) {
-        val cls = current::class.simpleName ?: "Throwable"
         val msg = current.message
-        parts += if (msg.isNullOrBlank()) cls else "$cls: $msg"
+        parts += when {
+            current is TimeoutCancellationException -> "The robot didn't answer in time"
+            msg.isNullOrBlank() -> current::class.simpleName ?: "Throwable"
+            else -> msg
+        }
         current = current.cause?.takeIf { it !== current }
     }
-    return parts.joinToString(" → ")
+    return parts.distinct().joinToString(" → ")
 }

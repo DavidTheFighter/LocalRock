@@ -64,7 +64,7 @@ fun ScheduleScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Routines") },
+                title = { Text("Schedule") },
                 navigationIcon = {
                     IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }
                 },
@@ -72,7 +72,7 @@ fun ScheduleScreen(
         },
         floatingActionButton = {
             FloatingActionButton(onClick = { showAddDialog = true }) {
-                Icon(Icons.Default.Add, "Add routine")
+                Icon(Icons.Default.Add, "Add schedule")
             }
         },
     ) { padding ->
@@ -80,7 +80,7 @@ fun ScheduleScreen(
             Box(Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     Icon(Icons.Default.Schedule, null, Modifier.size(48.dp), MaterialTheme.colorScheme.onSurfaceVariant)
-                    Text("No routines yet", style = MaterialTheme.typography.titleMedium)
+                    Text("No schedules yet", style = MaterialTheme.typography.titleMedium)
                     Text(
                         "Tap + to schedule a recurring clean",
                         style = MaterialTheme.typography.bodySmall,
@@ -158,7 +158,7 @@ private fun AddTimerDialog(onAdd: (hour: Int, minute: Int, weekdays: Set<Int>) -
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("New Routine") },
+        title = { Text("New schedule") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
                 Text("Time", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)

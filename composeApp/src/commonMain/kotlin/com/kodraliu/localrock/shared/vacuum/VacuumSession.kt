@@ -22,6 +22,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.buildJsonObject
@@ -29,6 +30,9 @@ import kotlinx.serialization.json.put
 import kotlin.random.Random
 
 class VacuumException(message: String, cause: Throwable? = null) : RuntimeException(message, cause)
+
+/** The robot sent nothing at all for a command, not even the `["retry"]` it sends while it works. */
+class RobotSilentException(val method: String) : RuntimeException("The robot didn't answer $method")
 
 
 class VacuumSession(
@@ -39,13 +43,27 @@ class VacuumSession(
     private val random: Random = Random.Default,
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
     private val demo: Boolean = false,
+    /**
+     * Ids this session draws from. Two sessions listening to the same robot must use ranges that
+     * do not overlap, or a reply meant for one could complete a request of the other.
+     */
+    private val requestIds: IntRange = PRIMARY_REQUEST_IDS,
 ) {
     // In demo mode the session performs no MQTT I/O: start/close are no-ops and every command
     // resolves to an empty response, so the repository's control methods become harmless no-ops.
     private val emptyResponse = V1Response(id = null, result = null, error = null)
     private val mutex = Mutex()
-    private var nextId = random.nextInt(REQUEST_ID_MIN, REQUEST_ID_MAX + 1)
-    private val pending = mutableMapOf<Int, CompletableDeferred<V1Response>>()
+    private var nextId = random.nextInt(requestIds.first, requestIds.last + 1)
+    private val pending = mutableMapOf<Int, PendingRequest>()
+
+    private class PendingRequest {
+        val answer = CompletableDeferred<V1Response>()
+        /** Completed by the first reply of any kind, the provisional `["retry"]` included. */
+        val heard = CompletableDeferred<Unit>()
+    }
+
+    /** The params shape this robot takes for map commands (see [sendDataCommand]). */
+    internal val dataParamsFormat = DataParamsFormat()
     private val _dpsUpdates = MutableStateFlow<Map<Int, JsonElement>>(emptyMap())
     val dpsUpdates: StateFlow<Map<Int, JsonElement>> = _dpsUpdates
     private var collectorJob: Job? = null
@@ -81,16 +99,21 @@ class VacuumSession(
         timeoutMs: Long = 10_000L,
     ): V1Response = sendCommandRaw(method, JsonArray(params), timeoutMs)
 
+    /**
+     * With [firstReplyTimeoutMs] the robot must send something for this request within that time,
+     * the provisional `["retry"]` counts, or [RobotSilentException] is thrown.
+     */
     suspend fun sendCommandRaw(
         method: String,
         params: JsonElement,
         timeoutMs: Long = 10_000L,
+        firstReplyTimeoutMs: Long? = null,
     ): V1Response {
         if (demo) return emptyResponse
         val requestId = nextRequestId()
         val ts = nowEpochSeconds()
-        val deferred = CompletableDeferred<V1Response>()
-        mutex.withLock { pending[requestId] = deferred }
+        val request = PendingRequest()
+        mutex.withLock { pending[requestId] = request }
         try {
             val v1Payload = V1Envelope.encodeRequestRaw(requestId, method, params, ts)
             val frame = RoborockCodec(localKey, prefixed = false).encode(
@@ -104,7 +127,10 @@ class VacuumSession(
             )
             println("[VacLocal] publish method=$method id=$requestId topic=${topics.publishTopic} bytes=${frame.size}")
             mqtt.publish(topics.publishTopic, frame)
-            return withTimeout(timeoutMs) { deferred.await() }
+            if (firstReplyTimeoutMs != null) {
+                withTimeoutOrNull(firstReplyTimeoutMs) { request.heard.await() } ?: throw RobotSilentException(method)
+            }
+            return withTimeout(timeoutMs) { request.answer.await() }
         } finally {
             mutex.withLock { pending.remove(requestId) }
         }
@@ -132,7 +158,10 @@ class VacuumSession(
         subscribedTopic?.let { runCatching { mqtt.unsubscribe(it) } }
         subscribedTopic = null
         mutex.withLock {
-            for ((_, def) in pending) def.cancel()
+            for ((_, request) in pending) {
+                request.answer.cancel()
+                request.heard.cancel()
+            }
             pending.clear()
             pendingMap?.cancel()
             pendingMap = null
@@ -192,9 +221,12 @@ class VacuumSession(
                 resp.id?.let { id ->
                     // Commands sent with need_retry get an immediate ["retry"] and the real
                     // answer later under the same id, so only the real answer completes them.
-                    if (!resp.isProvisionalRetry()) {
-                        val def = mutex.withLock { pending.remove(id) }
-                        def?.complete(resp)
+                    if (resp.isProvisionalRetry()) {
+                        mutex.withLock { pending[id] }?.heard?.complete(Unit)
+                    } else {
+                        val request = mutex.withLock { pending.remove(id) }
+                        request?.heard?.complete(Unit)
+                        request?.answer?.complete(resp)
                     }
                 }
                 println("[VacLocal] rpc response id=${resp.id} result=${resp.result} error=${resp.error}")
@@ -218,19 +250,25 @@ class VacuumSession(
 
     private suspend fun nextRequestId(): Int = mutex.withLock {
         val id = nextId
-        nextId = if (nextId >= REQUEST_ID_MAX) REQUEST_ID_MIN else nextId + 1
+        nextId = if (nextId >= requestIds.last) requestIds.first else nextId + 1
         id
     }
 
-    private companion object {
-        const val REQUEST_ID_MIN = 10000
-        const val REQUEST_ID_MAX = 32767
-        const val SEQ_MIN = 100000
-        const val SEQ_MAX = 999999
-        const val RANDOM_MIN = 10000
-        const val RANDOM_MAX = 99999
-        const val V1_DPS_REQUEST = 101
-        const val V1_DPS_RESPONSE = 102
+    companion object {
+        // Together these cover 10000..32767, the span the robot is known to accept.
+        /** The session behind a robot's own screens. */
+        val PRIMARY_REQUEST_IDS = 10000..25999
+        /** The always-on session that watches a robot for alerts. */
+        val MONITOR_REQUEST_IDS = 26000..29999
+        /** Short-lived reachability checks from the device list. */
+        val PROBE_REQUEST_IDS = 30000..32767
+
+        private const val SEQ_MIN = 100000
+        private const val SEQ_MAX = 999999
+        private const val RANDOM_MIN = 10000
+        private const val RANDOM_MAX = 99999
+        private const val V1_DPS_REQUEST = 101
+        private const val V1_DPS_RESPONSE = 102
     }
 }
 

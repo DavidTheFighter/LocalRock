@@ -23,6 +23,9 @@ import kotlinx.serialization.json.jsonPrimitive
  * `["retry"]`, then with the real result), and the app brackets edits with start_edit_map /
  * end_edit_map. All coordinates are robot millimetres, the same space the map blocks use.
  *
+ * Older firmware takes the same commands without the `{"data": ...}` object; [sendDataCommand]
+ * falls back to that.
+ *
  * Deliberately missing until a capture shows it: no-mop zones.
  */
 
@@ -103,11 +106,73 @@ private fun quad(z: MapZone): List<JsonPrimitive> =
 
 private fun withRetry(data: JsonElement) = JsonObject(mapOf("data" to data, "need_retry" to JsonPrimitive(1)))
 
+/** The robot's answer to params in a shape it does not take (S7: "Param is not an array"). */
+internal const val PARAM_FORMAT_REFUSED_CODE = -10005
+
+/** Firmware that knows the wrapped form acknowledged it with `["retry"]` within a second (captured). */
+private const val RETRY_ACK_TIMEOUT_MS = 6_000L
+
+/** Which params shape a robot takes for the commands sent through [sendDataCommand]. */
+internal class DataParamsFormat {
+    /** True once the robot has taken a command as plain params. */
+    var plain = false
+}
+
+private fun V1Response.errorCode(): Int? =
+    runCatching { error?.get("code")?.jsonPrimitive?.contentOrNull?.toIntOrNull() }.getOrNull()
+
+/**
+ * Send a command whose captured params are `{"data": <data>, "need_retry": 1}`. Older firmware
+ * takes [data] alone as the params:
+ * - an S7 on 02.15.78 refused the wrapped save_map with -10005 "Param is not an array" and applied
+ *   the plain save_map, split_segment and merge_segment (tested on the robot by the reporter of
+ *   issue #14);
+ * - an S5 Max never answered the wrapped load_multi_map (issue #11).
+ *
+ * So the wrapped form goes first, and the plain one follows when the robot refuses the shape or
+ * stays silent: [send] throws [RobotSilentException] when not even the `["retry"]` arrives. A
+ * refused or ignored command changed nothing, so sending it again is safe. Once the plain form
+ * has been taken, [format] keeps the robot on it.
+ */
+internal suspend fun sendDataCommand(
+    format: DataParamsFormat,
+    data: JsonElement,
+    send: suspend (params: JsonElement, wrapped: Boolean) -> V1Response,
+): V1Response {
+    if (!format.plain) {
+        val answer = try {
+            send(withRetry(data), true)
+        } catch (e: RobotSilentException) {
+            null
+        }
+        if (answer != null && answer.errorCode() != PARAM_FORMAT_REFUSED_CODE) return answer
+    }
+    val answer = send(data, false)
+    if (answer.errorCode() != PARAM_FORMAT_REFUSED_CODE) format.plain = true
+    return answer
+}
+
+internal suspend fun VacuumSession.sendData(method: String, data: JsonElement): V1Response =
+    sendDataCommand(dataParamsFormat, data) { params, wrapped ->
+        sendCommandRaw(
+            method, params,
+            timeoutMs = MAP_EDIT_TIMEOUT_MS,
+            firstReplyTimeoutMs = if (wrapped) RETRY_ACK_TIMEOUT_MS else null,
+        )
+    }.requireOk(method)
+
 /**
  * `{"data": [walls..., no-go zones..., [100, mapIndex]], "need_retry": 1}`, the order the official
  * app used. Zone corners are written in the order they were read so an untouched zone round-trips.
  */
-internal fun encodeSaveMapParams(noGoZones: List<MapZone>, walls: List<VirtualWall>, mapIndex: Int): JsonObject {
+internal fun encodeSaveMapParams(noGoZones: List<MapZone>, walls: List<VirtualWall>, mapIndex: Int): JsonObject =
+    withRetry(saveMapData(noGoZones, walls, mapIndex))
+
+/**
+ * `[walls..., no-go zones..., [100, mapIndex]]`. The S7 takes the same list as its plain params,
+ * `[100, 0]` included, and replaces its whole set with it like the S8 does (issue #14).
+ */
+internal fun saveMapData(noGoZones: List<MapZone>, walls: List<VirtualWall>, mapIndex: Int): JsonArray {
     if (mapIndex != 0) throw MapEditException("Saving zones is only confirmed for map index 0")
     val vertices = restrictionVertexCount(walls.size, noGoZones.size)
     if (vertices > MAX_RESTRICTION_VERTICES) {
@@ -120,12 +185,15 @@ internal fun encodeSaveMapParams(noGoZones: List<MapZone>, walls: List<VirtualWa
         noGoZones.forEach { add(JsonArray(listOf(JsonPrimitive(SAVE_MAP_TYPE_NO_GO)) + quad(it))) }
         add(JsonArray(listOf(JsonPrimitive(SAVE_MAP_TYPE_MAP_INDEX), JsonPrimitive(mapIndex))))
     }
-    return withRetry(JsonArray(entries))
+    return JsonArray(entries)
 }
 
 /** `{"data": [segment, xA, yA, xB, yB], "need_retry": 1}` */
 internal fun encodeSplitSegmentParams(segment: Int, xA: Int, yA: Int, xB: Int, yB: Int): JsonObject =
-    withRetry(JsonArray(listOf(JsonPrimitive(segment), coord(xA), coord(yA), coord(xB), coord(yB))))
+    withRetry(splitSegmentData(segment, xA, yA, xB, yB))
+
+internal fun splitSegmentData(segment: Int, xA: Int, yA: Int, xB: Int, yB: Int): JsonArray =
+    JsonArray(listOf(JsonPrimitive(segment), coord(xA), coord(yA), coord(xB), coord(yB)))
 
 /** Direction value the official app sends for materials that have none. */
 internal const val NO_DIRECTION = -1
@@ -143,14 +211,16 @@ data class SegmentEntry(val segment: Int, val roomId: String, val tagId: Int)
  * `{"data": [{"iotRoomId", "robotRoomId", "robotTagId"}, ...], "need_retry": 1}` with the whole
  * table, sorted by segment like the official app sent it.
  */
-internal fun encodeNameSegmentParams(table: List<SegmentEntry>): JsonObject =
-    withRetry(JsonArray(table.sortedBy { it.segment }.map { e ->
+internal fun encodeNameSegmentParams(table: List<SegmentEntry>): JsonObject = withRetry(nameSegmentData(table))
+
+internal fun nameSegmentData(table: List<SegmentEntry>): JsonArray =
+    JsonArray(table.sortedBy { it.segment }.map { e ->
         JsonObject(mapOf(
             "iotRoomId" to JsonPrimitive(e.roomId),
             "robotRoomId" to JsonPrimitive(e.segment),
             "robotTagId" to JsonPrimitive(e.tagId),
         ))
-    }))
+    })
 
 /**
  * The final name_segment answer maps each segment to its id afterwards:
@@ -184,8 +254,7 @@ suspend fun <T> VacuumSession.inEditSession(block: suspend () -> T): T {
 
 /** Replaces the robot's whole restriction set with exactly these walls and no-go zones. */
 suspend fun VacuumSession.saveMap(noGoZones: List<MapZone>, walls: List<VirtualWall>, mapIndex: Int): V1Response =
-    sendCommandRaw("save_map", encodeSaveMapParams(noGoZones, walls, mapIndex), timeoutMs = MAP_EDIT_TIMEOUT_MS)
-        .requireOk("save_map")
+    sendData("save_map", saveMapData(noGoZones, walls, mapIndex))
 
 /**
  * `{"map_index": 0, "type": 1, "zone_data": [[8 coords], ...]}`. The list is the complete set of
@@ -248,7 +317,10 @@ fun thresholdStrip(a: Pair<Int, Int>, b: Pair<Int, Int>): MapZone {
 
 /** `{"data": [segmentA, segmentB], "need_retry": 1}` */
 internal fun encodeMergeSegmentParams(segmentA: Int, segmentB: Int): JsonObject =
-    withRetry(JsonArray(listOf(JsonPrimitive(segmentA), JsonPrimitive(segmentB))))
+    withRetry(mergeSegmentData(segmentA, segmentB))
+
+internal fun mergeSegmentData(segmentA: Int, segmentB: Int): JsonArray =
+    JsonArray(listOf(JsonPrimitive(segmentA), JsonPrimitive(segmentB)))
 
 /** The robot's answer when it can't divide a room along the given line. */
 internal const val SPLIT_FAILED_CODE = -10006
@@ -276,20 +348,17 @@ suspend fun VacuumSession.setThresholds(thresholds: List<MapZone>, mapIndex: Int
         .requireOk("app_set_smart_door_sill")
 
 suspend fun VacuumSession.mergeSegment(segmentA: Int, segmentB: Int): V1Response =
-    sendCommandRaw("merge_segment", encodeMergeSegmentParams(segmentA, segmentB), timeoutMs = MAP_EDIT_TIMEOUT_MS)
-        .requireOk("merge_segment")
+    sendData("merge_segment", mergeSegmentData(segmentA, segmentB))
 
 suspend fun VacuumSession.splitSegment(segment: Int, xA: Int, yA: Int, xB: Int, yB: Int): V1Response =
-    sendCommandRaw("split_segment", encodeSplitSegmentParams(segment, xA, yA, xB, yB), timeoutMs = MAP_EDIT_TIMEOUT_MS)
-        .requireOk("split_segment")
+    sendData("split_segment", splitSegmentData(segment, xA, yA, xB, yB))
 
 suspend fun VacuumSession.setSegmentGroundMaterial(segment: Int, materialId: Int, direction: Int?): V1Response =
     sendCommandRaw("set_segment_ground_material", encodeGroundMaterialParams(segment, materialId, direction), timeoutMs = MAP_EDIT_TIMEOUT_MS)
         .requireOk("set_segment_ground_material")
 
 suspend fun VacuumSession.nameSegment(table: List<SegmentEntry>): V1Response =
-    sendCommandRaw("name_segment", encodeNameSegmentParams(table), timeoutMs = MAP_EDIT_TIMEOUT_MS)
-        .requireOk("name_segment")
+    sendData("name_segment", nameSegmentData(table))
 
 /*
  * Map management, from a capture of the official app on the S8 Pro Ultra (2026-09-29): rename,
@@ -339,11 +408,12 @@ suspend fun VacuumSession.startBuildMap(): V1Response =
  */
 
 /** `{"data": [mapFlag], "need_retry": 1}` */
-internal fun encodeLoadMultiMapParams(mapFlag: Int): JsonObject = withRetry(JsonArray(listOf(JsonPrimitive(mapFlag))))
+internal fun encodeLoadMultiMapParams(mapFlag: Int): JsonObject = withRetry(loadMultiMapData(mapFlag))
+
+internal fun loadMultiMapData(mapFlag: Int): JsonArray = JsonArray(listOf(JsonPrimitive(mapFlag)))
 
 suspend fun VacuumSession.loadMultiMap(mapFlag: Int): V1Response =
-    sendCommandRaw("load_multi_map", encodeLoadMultiMapParams(mapFlag), timeoutMs = MAP_EDIT_TIMEOUT_MS)
-        .requireOk("load_multi_map")
+    sendData("load_multi_map", loadMultiMapData(mapFlag))
 
 /** map_flag -1: store the map just built as a new map. */
 internal const val NEW_MAP_FLAG = -1
@@ -364,18 +434,24 @@ private const val SAVE_NEW_MAP_TIMEOUT_MS = 60_000L
  * set_lab_status with the map to keep as reserve_map; the robot deleted every other map. Turning
  * it back on sent lab_status 3 alone, then set_switch_map_mode {"mode": 1}. Status reports both
  * as lab_status and switch_map_mode.
+ *
+ * A robot that never met the official app reports lab_status 0 and refuses manual_segment_map
+ * with "The Lab Status is disable" (S8 on 02.33.88, issue #17). A Qrevo S5V on the same firmware
+ * took the plain `[{"lab_status": 1}]` (local_roborock_server issue #148).
  */
 
 /** `{"data": [{"lab_status": 1, "reserve_map": 0}], "need_retry": 1}`, or without reserve_map when turning it on. */
 internal fun encodeSetLabStatusParams(labStatus: Int, reserveMap: Int?): JsonObject =
-    withRetry(JsonArray(listOf(JsonObject(buildMap {
+    withRetry(labStatusData(labStatus, reserveMap))
+
+internal fun labStatusData(labStatus: Int, reserveMap: Int?): JsonArray =
+    JsonArray(listOf(JsonObject(buildMap {
         put("lab_status", JsonPrimitive(labStatus))
         reserveMap?.let { put("reserve_map", JsonPrimitive(it)) }
-    }))))
+    })))
 
 suspend fun VacuumSession.setLabStatus(labStatus: Int, reserveMap: Int?): V1Response =
-    sendCommandRaw("set_lab_status", encodeSetLabStatusParams(labStatus, reserveMap), timeoutMs = MAP_EDIT_TIMEOUT_MS)
-        .requireOk("set_lab_status")
+    sendData("set_lab_status", labStatusData(labStatus, reserveMap))
 
 /** `{"mode": 0}` recognise the floor automatically, `{"mode": 1}` pick it by hand. */
 internal fun encodeSwitchMapModeParams(mode: Int): JsonObject = JsonObject(mapOf("mode" to JsonPrimitive(mode)))

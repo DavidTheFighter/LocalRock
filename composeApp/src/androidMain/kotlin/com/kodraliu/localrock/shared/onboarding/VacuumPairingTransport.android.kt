@@ -75,7 +75,11 @@ actual class VacuumPairingTransport internal constructor(private val context: Co
             net.bindSocket(socket)
         } catch (e: Throwable) {
             socket.close()
-            throw VacuumPairingException("bindSocket failed: ${e.message}", e)
+            throw VacuumPairingException(
+                "Couldn't talk to the vacuum over its Wi-Fi (${e.message}). " +
+                    "A VPN on this phone causes this: turn it off and try again.",
+                e,
+            )
         }
         socketRef.set(socket)
     }

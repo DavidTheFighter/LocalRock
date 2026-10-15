@@ -53,6 +53,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import com.kodraliu.localrock.shared.device.Reachability
 import com.kodraliu.localrock.shared.model.Device
 import com.kodraliu.localrock.shared.onboarding.vacuumPairingSupported
 import com.kodraliu.localrock.ui.AppColors
@@ -68,6 +69,7 @@ fun DeviceListScreen(
 ) {
     val devices by viewModel.devices.collectAsState()
     val products by viewModel.productsByDuid.collectAsState()
+    val reachability by viewModel.reachability.collectAsState()
     val refreshing by viewModel.refreshing.collectAsState()
     val error by viewModel.error.collectAsState()
     var showLogoutDialog by remember { mutableStateOf(false) }
@@ -150,6 +152,7 @@ fun DeviceListScreen(
                             DeviceCard(
                                 device = device,
                                 model = products[device.duid]?.model.orEmpty(),
+                                reachability = reachability[device.duid],
                                 onClick = { onDeviceClick(device) },
                             )
                         }
@@ -249,17 +252,24 @@ private fun ErrorCard(message: String, onRetry: () -> Unit) {
 }
 
 @Composable
-private fun DeviceCard(device: Device, model: String, onClick: () -> Unit) {
+private fun DeviceCard(device: Device, model: String, reachability: Reachability?, onClick: () -> Unit) {
     // Without a local key there is nothing to talk to, so say that instead of silently ignoring taps.
     val notPaired = device.localKey == null
+    // The robot's own answer wins; the server's flag is only used when the robot could not be asked.
+    val online = when (reachability) {
+        Reachability.ONLINE -> true
+        Reachability.OFFLINE, Reachability.CHECKING -> false
+        null -> device.online
+    }
     val statusColor = when {
         notPaired -> MaterialTheme.colorScheme.error
-        device.online -> AppColors.Good
+        online -> AppColors.Good
         else -> MaterialTheme.colorScheme.outline
     }
     val statusText = when {
         notPaired -> "Setup incomplete"
-        device.online -> "Online"
+        reachability == Reachability.CHECKING -> "Checking…"
+        online -> "Online"
         else -> "Offline"
     }
 
@@ -279,7 +289,7 @@ private fun DeviceCard(device: Device, model: String, onClick: () -> Unit) {
             // A per-robot state badge is more useful here than repeating the app icon on every row.
             Surface(
                 shape = RoundedCornerShape(14.dp),
-                color = if (device.online && !notPaired) MaterialTheme.colorScheme.primaryContainer
+                color = if (online && !notPaired) MaterialTheme.colorScheme.primaryContainer
                 else MaterialTheme.colorScheme.surfaceContainerHighest,
                 modifier = Modifier.size(48.dp),
             ) {
@@ -288,7 +298,7 @@ private fun DeviceCard(device: Device, model: String, onClick: () -> Unit) {
                         RobotVacuum,
                         contentDescription = null,
                         modifier = Modifier.size(26.dp),
-                        tint = if (device.online && !notPaired) MaterialTheme.colorScheme.onPrimaryContainer
+                        tint = if (online && !notPaired) MaterialTheme.colorScheme.onPrimaryContainer
                         else MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }

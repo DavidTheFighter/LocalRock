@@ -22,12 +22,25 @@ data class VacuumStatus(
     @SerialName("rdt") val remainingDryTimeSec: Long? = null,
     /** Loaded map in the upper bits (see [loadedMapFlag]). */
     @SerialName("map_status") val mapStatus: Int? = null,
-    /** Bit [LAB_STATUS_MULTI_LEVEL] set while multi-level maps are on (captured 3 on, 1 off). */
+    /**
+     * Bit [LAB_STATUS_MAP_SAVING] set while the robot keeps maps, bit [LAB_STATUS_MULTI_LEVEL] while
+     * multi-level maps are on (captured 3 and 1; 0 on a robot that never met the official app).
+     */
     @SerialName("lab_status") val labStatus: Int? = null,
     /** 0 = recognise the floor automatically, 1 = pick the map by hand (captured). */
     @SerialName("switch_map_mode") val switchMapMode: Int? = null,
+    /**
+     * 0 once a clean job is over. Stays non-zero through the breaks inside one (recharging,
+     * washing the mop), which is how the end of a job is told from a pause in it.
+     */
+    @SerialName("in_cleaning") val inCleaning: Int? = null,
+    /** How far through the current job the robot says it is, 0..100. */
+    @SerialName("clean_percent") val cleanPercent: Int? = null,
 ) {
     val multiLevelEnabled: Boolean? get() = labStatus?.let { it and LAB_STATUS_MULTI_LEVEL != 0 }
+
+    /** False on a robot that will not store a map: it refuses manual_segment_map (issue #17). */
+    val mapSavingEnabled: Boolean? get() = labStatus?.let { it and LAB_STATUS_MAP_SAVING != 0 }
 
     /**
      * mapFlag of the map the robot has loaded: map_status >> 2 (captured 2026-09-29: 7 with map 1
@@ -43,6 +56,7 @@ data class VacuumStatus(
         get() = loadedMapFlag == UNSAVED_MAP_FLAG && mapStatus?.and(MAP_STATUS_PRESENT) != 0
 }
 
+const val LAB_STATUS_MAP_SAVING = 1
 const val LAB_STATUS_MULTI_LEVEL = 2
 const val SWITCH_MAP_MODE_SMART = 0
 const val SWITCH_MAP_MODE_MANUAL = 1
@@ -61,6 +75,17 @@ object DockErrorCodes {
     const val DIRTY_TANK_LATCH_OPEN = 44
     const val NO_DUSTBIN = 46
     const val CLEANING_TANK_FULL_OR_BLOCKED = 53
+
+    fun describe(code: Int): String = when (code) {
+        OK -> ""
+        DUCT_BLOCKAGE -> "Dock dust duct blocked"
+        WATER_EMPTY -> "Clean water tank empty"
+        DIRTY_TANK_FULL -> "Dirty water tank full"
+        DIRTY_TANK_LATCH_OPEN -> "Dirty water tank latch open"
+        NO_DUSTBIN -> "Dock dust bag missing"
+        CLEANING_TANK_FULL_OR_BLOCKED -> "Dock cleaning tray full or blocked"
+        else -> "Dock error $code"
+    }
 }
 
 
@@ -83,6 +108,7 @@ object VacuumStateCodes {
     const val GOING_TO_TARGET = 16
     const val ZONED_CLEANING = 17
     const val SEGMENT_CLEANING = 18
+    const val EMPTYING_BIN = 22
     const val NOT_CHARGING = 24
     const val WASHING_MOP = 23
     const val GOING_TO_WASH_MOP = 26
@@ -90,6 +116,37 @@ object VacuumStateCodes {
     const val RETURNING_TO_DOCK_FOR_DRYING = 28
     /** Captured 2026-09-29: the robot reports 29 for the whole app_start_build_map run. */
     const val MAPPING = 29
+    const val CHARGING_COMPLETE = 100
+
+    fun describe(state: Int): String = when (state) {
+        STARTING -> "Starting"
+        CHARGER_DISCONNECTED -> "Charger disconnected"
+        IDLE -> "Idle"
+        REMOTE_CONTROL_ACTIVE -> "Remote control"
+        CLEANING -> "Cleaning"
+        RETURNING_HOME -> "Returning home"
+        MANUAL_MODE -> "Manual mode"
+        CHARGING -> "Charging"
+        CHARGING_ERROR -> "Charging error"
+        PAUSED -> "Paused"
+        SPOT_CLEANING -> "Spot cleaning"
+        ERROR -> "Error"
+        SHUTTING_DOWN -> "Shutting down"
+        UPDATING -> "Updating"
+        DOCKING -> "Docking"
+        GOING_TO_TARGET -> "Going to target"
+        ZONED_CLEANING -> "Zoned cleaning"
+        SEGMENT_CLEANING -> "Room cleaning"
+        MAPPING -> "Mapping"
+        NOT_CHARGING -> "Idle"
+        WASHING_MOP -> "Washing mop"
+        GOING_TO_WASH_MOP -> "Going to wash mop"
+        DRYING_MOP -> "Drying mop"
+        RETURNING_TO_DOCK_FOR_DRYING -> "Returning to dock"
+        EMPTYING_BIN -> "Emptying the bin"
+        CHARGING_COMPLETE -> "Fully charged"
+        else -> "State $state"
+    }
 }
 
 object VacuumErrorCodes {
@@ -136,6 +193,9 @@ object VacuumFanPower {
     const val BALANCED = 102
     const val TURBO = 103
     const val MAX = 104
+    /** No suction: what the official app sets for its Mop tab (captured on an S8 Pro Ultra). */
+    const val OFF = 105
+    const val CUSTOM = 106
     const val SMART = 110
 }
 
@@ -145,6 +205,7 @@ object WaterBoxMode {
     const val LOW = 201
     const val MEDIUM = 202
     const val HIGH = 203
+    const val CUSTOM = 204
     const val SMART = 209
     const val SLIDE_MEDIUM = 235
 
@@ -161,6 +222,7 @@ object WaterBoxMode {
 object MopRoute {
     const val STANDARD = 300
     const val DEEP = 301
+    const val CUSTOM = 302
     const val DEEP_PLUS = 303
     const val FAST = 304
     const val SMART = 306

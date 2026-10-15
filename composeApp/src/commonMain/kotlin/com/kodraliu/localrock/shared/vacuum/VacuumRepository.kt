@@ -23,6 +23,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
@@ -133,6 +134,9 @@ class VacuumRepository(
     private val _mopMode = MutableStateFlow<Int?>(null)
     val mopMode: StateFlow<Int?> = _mopMode
 
+    private val _roomCleanModes = MutableStateFlow<List<RoomCleanMode>>(emptyList())
+    val roomCleanModes: StateFlow<List<RoomCleanMode>> = _roomCleanModes
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     /** The loaded map's mapFlag, from the robot's map_status when it reports one. */
@@ -165,6 +169,9 @@ class VacuumRepository(
 
             var consecutiveFailures = 0
             while (isActive) {
+                // While the link is (re)connecting a request fails at once. Wait for it instead,
+                // so the first status goes out the moment it is up.
+                mqttClient.connected.first { it }
                 runCatching { session.ensureSubscribed() }
                 runCatching { session.getStatus() }
                     .onSuccess { fresh ->
@@ -199,11 +206,21 @@ class VacuumRepository(
             }
         }
         mapPollJob = scope.launch {
-            runCatching { fetchMap() }.onFailure { println("[VacLocal] fetchMap FAILED: ${it::class.simpleName}: ${it.message}") }
+            var loaded = false
             while (isActive) {
-                val fastPoll = _status.value.state in ACTIVE_STATES
-                delay(if (fastPoll) MAP_FAST_POLL_MS else MAP_IDLE_POLL_MS)
+                mqttClient.connected.first { it }
                 runCatching { fetchMap() }
+                    .onSuccess { loaded = true }
+                    .onFailure { println("[VacLocal] fetchMap FAILED: ${it::class.simpleName}: ${it.message}") }
+                // Until a map has arrived, ask again soon: sitting out the idle minute after a
+                // failed first request left the screen without a map for up to two minutes.
+                delay(
+                    when {
+                        !loaded -> MAP_RETRY_MS
+                        _status.value.state in ACTIVE_STATES -> MAP_FAST_POLL_MS
+                        else -> MAP_IDLE_POLL_MS
+                    }
+                )
             }
         }
     }
@@ -226,7 +243,6 @@ class VacuumRepository(
         scope.launch { session.close() }
     }
 
-    suspend fun clean(): V1Response = session.appStart()
     suspend fun pause(): V1Response = session.appPause()
     suspend fun stopCleaning(): V1Response = session.appStop()
     suspend fun dock(): V1Response = session.appCharge()
@@ -244,13 +260,7 @@ class VacuumRepository(
                 } else null
             }
             // Names resolve from the first two columns, which every firmware returns.
-            val mapping = result.mapNotNull { entry ->
-                if (entry is JsonArray && entry.size >= 2) {
-                    val segment = entry[0].jsonPrimitive.intOrNull ?: return@mapNotNull null
-                    val roomId = entry[1].jsonPrimitive.content.toLongOrNull() ?: return@mapNotNull null
-                    segment to roomId
-                } else null
-            }.toMap()
+            val mapping = parseRoomMapping(result)
             if (mapping.isNotEmpty()) {
                 segmentToRoomId = mapping
                 println("[VacLocal] room mapping seg->roomId=$mapping resolved=${mapping.mapValues { homeRoomNames[it.value] ?: "(no home name)" }}")
@@ -277,8 +287,58 @@ class VacuumRepository(
         _rooms.update { list -> list.map { it.copy(name = resolveRoomName(it)) } }
     }
 
-    suspend fun cleanRooms(roomIds: List<Int>, repeat: Int = 1): V1Response =
-        session.appSegmentClean(roomIds, repeat)
+    /**
+     * Clean [roomIds] in the order given. The robot follows its stored sequence, so that is
+     * written first when it would clean them in another order. A robot that can't take the
+     * sequence still cleans the rooms, in its own order.
+     */
+    suspend fun cleanRooms(roomIds: List<Int>, repeat: Int = 1): V1Response {
+        if (roomIds.distinct().size >= 2) writeCleanSequence { stored -> cleanSequenceFor(roomIds, stored) }
+        return session.appSegmentClean(roomIds, repeat)
+    }
+
+    /**
+     * Start a full clean. With a [defaultOrder] the robot's sequence is put back to it first,
+     * since cleaning picked rooms may have rewritten it ([cleanRooms]). Rooms that are no longer on
+     * the map are left out.
+     */
+    suspend fun clean(defaultOrder: List<Int> = emptyList()): V1Response {
+        val onMap = _rooms.value.map { it.id }
+        val order = if (onMap.isEmpty()) defaultOrder else defaultOrder.filter { it in onMap }
+        if (order.isNotEmpty()) writeCleanSequence { stored -> order.takeIf { it != stored } }
+        return session.appStart()
+    }
+
+    /** Set once the robot fails a sequence command, so later cleans don't wait on it again. */
+    private var cleanSequenceRefused = false
+
+    /** Best effort: store what [wanted] returns for the robot's current sequence, if anything. */
+    private suspend fun writeCleanSequence(wanted: (stored: List<Int>) -> List<Int>?) {
+        if (demo || cleanSequenceRefused) return
+        runCatching {
+            val stored = parseCleanSequence(session.getCleanSequence().result)
+            wanted(stored)?.let { session.setCleanSequence(it) }
+        }.onFailure {
+            println("[VacLocal] room order not stored: $it")
+            cleanSequenceRefused = true
+        }
+    }
+
+    /**
+     * Store [order] as the robot's cleaning sequence. Captured with the robot idle only, so a busy
+     * robot is refused here. Confirmed by reading the sequence back.
+     */
+    suspend fun saveCleanSequence(order: List<Int>) {
+        if (demo) throw MapEditException("The cleaning order can't be saved in demo mode")
+        if (_status.value.state in ACTIVE_STATES) {
+            throw MapEditException("The robot is busy. Dock it or let it finish first.")
+        }
+        session.setCleanSequence(order)
+        if (parseCleanSequence(session.getCleanSequence().result) != order) {
+            throw MapEditException("The robot accepted the cleaning order, but does not report it back.")
+        }
+        cleanSequenceRefused = false
+    }
 
     suspend fun setFanPower(level: Int): V1Response = session.setCustomMode(level)
 
@@ -312,6 +372,25 @@ class VacuumRepository(
     suspend fun setCleanMotorMode(fanPower: Int, waterBoxMode: Int, mopMode: Int) {
         session.setCleanMotorMode(fanPower, waterBoxMode, mopMode).requireOk("set_clean_motor_mode")
         _mopMode.value = mopMode
+    }
+
+    /** The per-room settings the robot holds for the loaded map. */
+    suspend fun fetchRoomCleanModes() {
+        _roomCleanModes.value = parseCustomizeCleanMode(session.getCustomizeCleanMode().result)
+    }
+
+    /**
+     * Write per-room settings inside an edit session, as the official app does. Captured with the
+     * robot idle only, so a busy robot is refused here. Confirmed by reading the settings back.
+     */
+    suspend fun saveRoomCleanModes(modes: List<RoomCleanMode>): Unit = mapEditMutex.withLock {
+        if (demo) throw MapEditException("Room settings can't be saved in demo mode")
+        if (_status.value.state in ACTIVE_STATES) {
+            throw MapEditException("The robot is busy. Dock it or let it finish first.")
+        }
+        session.inEditSession { session.setCustomizeCleanMode(modes) }
+        fetchRoomCleanModes()
+        if (!roomCleanModesStored(modes, _roomCleanModes.value)) throw MapEditException(ROOM_MODES_NOT_CONFIRMED)
     }
 
     suspend fun fetchConsumableStatus() {
@@ -606,7 +685,9 @@ class VacuumRepository(
         val lab = _status.value.labStatus
             ?: throw MapEditException("The robot didn't report its map settings. Nothing was changed.")
         if (enabled) {
-            session.setLabStatus(lab or LAB_STATUS_MULTI_LEVEL, reserveMap = null)
+            // 3, what the official app sent. From 0 (map saving off) the multi-level bit alone
+            // was refused with -10005 (issue #17).
+            session.setLabStatus(lab or LAB_STATUS_MAP_SAVING or LAB_STATUS_MULTI_LEVEL, reserveMap = null)
             // The official app followed this with manual map selection.
             session.setSwitchMapMode(SWITCH_MAP_MODE_MANUAL)
         } else {
@@ -624,6 +705,24 @@ class VacuumRepository(
             runCatching { fetchMap() }
             runCatching { rooms() }
         }
+    }
+
+    /**
+     * Turn on map saving for a robot that reports it off, which is how a robot starts out when it
+     * never met the official app. Until then it refuses to store a map. Confirmed by status.
+     */
+    suspend fun enableMapSaving(): Unit = mapEditMutex.withLock {
+        mapManageBlockedReason()?.let { throw MapEditException(it) }
+        enableMapSavingLocked()
+    }
+
+    private suspend fun enableMapSavingLocked() {
+        runCatching { refreshStatus() }
+        val lab = _status.value.labStatus
+            ?: throw MapEditException("The robot didn't report its map settings. Nothing was changed.")
+        if (lab and LAB_STATUS_MAP_SAVING != 0) return
+        session.setLabStatus(lab or LAB_STATUS_MAP_SAVING, reserveMap = null)
+        if (!awaitStatus { it.mapSavingEnabled == true }) throw MapEditException(NOT_CONFIRMED)
     }
 
     /** Recognise the floor automatically, or pick the map by hand. Confirmed by status. */
@@ -653,10 +752,15 @@ class VacuumRepository(
         if (!unsavedMapPresent.value) throw MapEditException("There is no new map to save")
         runCatching { fetchFloorMaps() }
         val before = _floorMaps.value.map { it.mapFlag }.toSet()
-        session.saveNewMap()
+        // With map saving off the robot answers manual_segment_map with "The Lab Status is disable".
+        if (_status.value.mapSavingEnabled == false) enableMapSavingLocked()
+        // Not seen on a robot: whether a map built while map saving was off is still there once
+        // it is on, so only ask for the save if the robot still reports the unsaved map.
+        val stillUnsaved = _status.value.unsavedMapPresent
+        if (stillUnsaved) session.saveNewMap()
         fetchFloorMaps()
         val added = _floorMaps.value.map { it.mapFlag }.toSet() - before
-        if (added.isEmpty()) throw MapEditException(NOT_CONFIRMED)
+        if (added.isEmpty()) throw MapEditException(if (stillUnsaved) NOT_CONFIRMED else MAP_NOT_KEPT)
         runCatching { refreshStatus() }
         rawSegmentTable = emptyList()
         runCatching { fetchMap() }
@@ -921,6 +1025,7 @@ class VacuumRepository(
         val ConsumableJson = Json { ignoreUnknownKeys = true; explicitNulls = false }
         const val MAP_FAST_POLL_MS = 8_000L
         const val MAP_IDLE_POLL_MS = 60_000L
+        const val MAP_RETRY_MS = 5_000L
         const val MAX_HISTORY_RECORDS = 20
 
         const val READBACK_ATTEMPTS = 4
@@ -936,6 +1041,13 @@ class VacuumRepository(
 
         const val NOT_CONFIRMED =
             "The robot accepted the change, but the map does not show it yet. Refresh the map in a moment to check."
+
+        const val ROOM_MODES_NOT_CONFIRMED =
+            "The robot accepted the room settings, but does not report them back. Open the cleaning mode again to check."
+
+        const val MAP_NOT_KEPT =
+            "Map saving is now on, but the robot did not keep the map it had built. " +
+                "Let it clean or map the home once more, then save the map."
 
         const val STALE_LINK_FAILURE_THRESHOLD = 3
 
@@ -980,6 +1092,21 @@ private fun parseCronTimer(id: String, enabled: Boolean, cron: String): CleanTim
 
 const val CONSUMABLE_UNSUPPORTED = "unsupported"
 
+/**
+ * Segment id -> Roborock room id from a `get_room_mapping` result (`[[segment, "roomId", tag], ...]`).
+ * Only the first two columns are read, which every firmware returns.
+ */
+internal fun parseRoomMapping(result: JsonElement?): Map<Int, Long> {
+    if (result !is JsonArray) return emptyMap()
+    return result.mapNotNull { entry ->
+        if (entry is JsonArray && entry.size >= 2) {
+            val segment = entry[0].jsonPrimitive.intOrNull ?: return@mapNotNull null
+            val roomId = entry[1].jsonPrimitive.content.toLongOrNull() ?: return@mapNotNull null
+            segment to roomId
+        } else null
+    }.toMap()
+}
+
 
 internal fun VacuumStatus.merge(fresh: VacuumStatus): VacuumStatus = fresh.copy(
     battery = fresh.battery ?: battery,
@@ -998,6 +1125,8 @@ internal fun VacuumStatus.merge(fresh: VacuumStatus): VacuumStatus = fresh.copy(
     mapStatus = fresh.mapStatus ?: mapStatus,
     labStatus = fresh.labStatus ?: labStatus,
     switchMapMode = fresh.switchMapMode ?: switchMapMode,
+    inCleaning = fresh.inCleaning ?: inCleaning,
+    cleanPercent = fresh.cleanPercent ?: cleanPercent,
 )
 
 

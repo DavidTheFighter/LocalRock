@@ -14,6 +14,7 @@ class DeviceListViewModel(
 
     val devices = container.deviceRepository.devices
     val productsByDuid = container.deviceRepository.productsByDuid
+    val reachability = container.deviceRepository.reachability
 
     private val _refreshing = MutableStateFlow(false)
     val refreshing: StateFlow<Boolean> = _refreshing.asStateFlow()
@@ -29,6 +30,7 @@ class DeviceListViewModel(
             _error.value = null
             try {
                 container.deviceRepository.refresh()
+                container.deviceRepository.probeReachability()
             } catch (e: Throwable) {
                 _error.value = e.message ?: "Failed to load devices"
             } finally {

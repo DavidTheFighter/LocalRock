@@ -18,6 +18,12 @@ private const val KEY_LAST_SEEN_VERSION = "last_seen_version"
 private const val KEY_DEMO_MODE = "demo_mode"
 private const val KEY_LOGIN_EMAIL = "login_email"
 private const val KEY_LOGIN_CODE = "login_code"
+private const val KEY_NOTIFY_ENABLED = "notify_enabled"
+private const val KEY_NOTIFY_ERRORS = "notify_errors"
+private const val KEY_NOTIFY_FINISHED = "notify_finished"
+private const val KEY_NOTIFY_DOCK = "notify_dock"
+private const val KEY_NOTIFY_BACKGROUND = "notify_background"
+private const val KEY_NOTIFY_PROGRESS = "notify_progress"
 
 class AppSettings(private val settings: Settings) {
 
@@ -93,11 +99,76 @@ class AppSettings(private val settings: Settings) {
         }
     }
 
+    /** Robot alerts as a whole. Off until asked for: turning them on needs the notification permission. */
+    private val _notifyEnabled = MutableStateFlow(settings.getBoolean(KEY_NOTIFY_ENABLED, false))
+    val notifyEnabled: StateFlow<Boolean> = _notifyEnabled.asStateFlow()
+
+    fun setNotifyEnabled(value: Boolean) {
+        settings.putBoolean(KEY_NOTIFY_ENABLED, value)
+        _notifyEnabled.value = value
+    }
+
+    private val _notifyErrors = MutableStateFlow(settings.getBoolean(KEY_NOTIFY_ERRORS, true))
+    val notifyErrors: StateFlow<Boolean> = _notifyErrors.asStateFlow()
+
+    fun setNotifyErrors(value: Boolean) {
+        settings.putBoolean(KEY_NOTIFY_ERRORS, value)
+        _notifyErrors.value = value
+    }
+
+    private val _notifyFinished = MutableStateFlow(settings.getBoolean(KEY_NOTIFY_FINISHED, true))
+    val notifyFinished: StateFlow<Boolean> = _notifyFinished.asStateFlow()
+
+    fun setNotifyFinished(value: Boolean) {
+        settings.putBoolean(KEY_NOTIFY_FINISHED, value)
+        _notifyFinished.value = value
+    }
+
+    private val _notifyDock = MutableStateFlow(settings.getBoolean(KEY_NOTIFY_DOCK, true))
+    val notifyDock: StateFlow<Boolean> = _notifyDock.asStateFlow()
+
+    fun setNotifyDock(value: Boolean) {
+        settings.putBoolean(KEY_NOTIFY_DOCK, value)
+        _notifyDock.value = value
+    }
+
+    /** Keep watching after the app is closed. Only does anything where the platform allows it. */
+    private val _notifyBackground = MutableStateFlow(settings.getBoolean(KEY_NOTIFY_BACKGROUND, false))
+    val notifyBackground: StateFlow<Boolean> = _notifyBackground.asStateFlow()
+
+    fun setNotifyBackground(value: Boolean) {
+        settings.putBoolean(KEY_NOTIFY_BACKGROUND, value)
+        _notifyBackground.value = value
+    }
+
+    /** A standing notification with the state and progress of a running clean job. */
+    private val _notifyProgress = MutableStateFlow(settings.getBoolean(KEY_NOTIFY_PROGRESS, true))
+    val notifyProgress: StateFlow<Boolean> = _notifyProgress.asStateFlow()
+
+    fun setNotifyProgress(value: Boolean) {
+        settings.putBoolean(KEY_NOTIFY_PROGRESS, value)
+        _notifyProgress.value = value
+    }
+
     fun cameraPin(duid: String): String? = settings.getStringOrNull("camera_pin_$duid")
 
     fun setCameraPin(duid: String, pin: String?) {
         if (pin.isNullOrBlank()) settings.remove("camera_pin_$duid")
         else settings.putString("camera_pin_$duid", pin)
+    }
+
+    /**
+     * The room order a full clean of one robot's map should follow, empty when none is set. Kept
+     * here because the robot's own sequence is rewritten whenever picked rooms are cleaned.
+     */
+    fun cleanOrder(duid: String, mapFlag: Int): List<Int> =
+        settings.getStringOrNull("clean_order_${duid}_$mapFlag")
+            ?.split(',')?.mapNotNull { it.toIntOrNull() }
+            ?: emptyList()
+
+    fun setCleanOrder(duid: String, mapFlag: Int, order: List<Int>) {
+        val key = "clean_order_${duid}_$mapFlag"
+        if (order.isEmpty()) settings.remove(key) else settings.putString(key, order.joinToString(","))
     }
 
     internal fun readUserDataJson(): String? = settings.getStringOrNull(KEY_USER_DATA)

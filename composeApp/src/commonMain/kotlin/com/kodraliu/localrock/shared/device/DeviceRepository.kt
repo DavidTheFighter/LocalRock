@@ -7,15 +7,25 @@ import com.kodraliu.localrock.shared.model.FirmwareUpdateInfo
 import com.kodraliu.localrock.shared.model.Home
 import com.kodraliu.localrock.shared.model.Product
 import com.kodraliu.localrock.shared.model.Room
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
 
 class DeviceRepository(
     private val deviceApi: DeviceApi,
     private val authRepository: AuthRepository,
     private val isDemo: () -> Boolean = { false },
+    /** Asks one robot whether it is there: true on a reply, false on silence, throws if it could not ask. */
+    private val probe: suspend (Device) -> Boolean = { it.online },
 ) {
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     private val _home = MutableStateFlow<Home?>(null)
     val home: StateFlow<Home?> = _home.asStateFlow()
@@ -26,6 +36,43 @@ class DeviceRepository(
 
     private val _products = MutableStateFlow<Map<String, Product>>(emptyMap())
     val productsByDuid: StateFlow<Map<String, Product>> = _products.asStateFlow()
+
+    /** Per duid; a robot with no entry has not been asked, so its server `online` flag is all there is. */
+    private val _reachability = MutableStateFlow<Map<String, Reachability>>(emptyMap())
+    val reachability: StateFlow<Map<String, Reachability>> = _reachability.asStateFlow()
+
+    private var probeJob: Job? = null
+
+    /**
+     * Ask every paired robot directly whether it is reachable. Returns at once; verdicts land in
+     * [reachability] as they come in. A robot keeps its previous verdict while it is re-checked,
+     * so a refresh does not flicker every card through "Checking".
+     */
+    fun probeReachability() {
+        if (isDemo()) return
+        val targets = _devicesFlow.value.filter { it.localKey != null }
+        probeJob?.cancel()
+        _reachability.update { previous ->
+            targets.associate { device ->
+                val known = previous[device.duid]?.takeIf { it != Reachability.CHECKING }
+                device.duid to (known ?: Reachability.CHECKING)
+            }
+        }
+        probeJob = scope.launch {
+            for (device in targets) launch {
+                val verdict = try {
+                    if (probe(device)) Reachability.ONLINE else Reachability.OFFLINE
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Throwable) {
+                    // Could not ask at all (no MQTT link), which says nothing about the robot.
+                    println("[VacLocal] reachability probe for ${device.duid} could not run: ${e.message}")
+                    null
+                }
+                _reachability.update { if (verdict == null) it - device.duid else it + (device.duid to verdict) }
+            }
+        }
+    }
 
     suspend fun refresh() {
         if (isDemo()) {

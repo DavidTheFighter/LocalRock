@@ -6,7 +6,9 @@ import com.kodraliu.localrock.shared.vacuum.map.MapZone
 import com.kodraliu.localrock.shared.vacuum.map.ParsedMap
 import com.kodraliu.localrock.shared.vacuum.map.VirtualWall
 import com.kodraliu.localrock.shared.vacuum.map.ZoneKind
+import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlin.test.Test
@@ -312,6 +314,118 @@ class MapEditCommandsTest {
         assertEquals(true, VacuumStatus(labStatus = 3).multiLevelEnabled)
         assertEquals(false, VacuumStatus(labStatus = 1).multiLevelEnabled)
         assertNull(VacuumStatus().multiLevelEnabled)
+    }
+
+    @Test
+    fun map_saving_is_off_at_lab_status_0() {
+        // Issue #17: an S8 that never met the official app reported lab_status 0.
+        assertEquals(false, VacuumStatus(labStatus = 0).mapSavingEnabled)
+        assertEquals(true, VacuumStatus(labStatus = 1).mapSavingEnabled)
+        assertEquals(true, VacuumStatus(labStatus = 3).mapSavingEnabled)
+        assertNull(VacuumStatus().mapSavingEnabled)
+        // Turning multi-level on from 0 must send the captured 3, not the multi-level bit alone.
+        assertEquals(3, 0 or LAB_STATUS_MAP_SAVING or LAB_STATUS_MULTI_LEVEL)
+    }
+
+    @Test
+    fun plain_forms_match_what_the_s7_applied() {
+        // Issue #14, each sent to an S7 on 02.15.78 by the reporter and applied by the robot.
+        assertEquals(
+            "[[1,14450,31050,25200,31050],[0,14300,31200,25355,31200,25355,30800,14300,30800],[100,0]]",
+            saveMapData(
+                listOf(MapZone(14300, 31200, 25355, 31200, 25355, 30800, 14300, 30800, ZoneKind.NO_GO)),
+                listOf(VirtualWall(14450, 31050, 25200, 31050)),
+                mapIndex = 0,
+            ).toString(),
+        )
+        assertEquals("[1,22517,25187,22636,33702]", splitSegmentData(1, 22517, 25187, 22636, 33702).toString())
+        assertEquals("[16,17]", mergeSegmentData(16, 17).toString())
+        // local_roborock_server issue #148: taken by a Qrevo S5V on 02.33.88.
+        assertEquals("""[{"lab_status":1}]""", labStatusData(1, reserveMap = null).toString())
+        assertEquals("[1]", loadMultiMapData(1).toString())
+    }
+
+    private val ok = V1Response(id = 1, result = Json.parseToJsonElement("""["ok"]"""), error = null)
+
+    private fun refused(code: Int, message: String) =
+        V1Response(id = 1, result = null, error = Json.parseToJsonElement("""{"code":$code,"message":"$message"}""").jsonObject)
+
+    /** Sends through [sendDataCommand] and records the params of every attempt. */
+    private suspend fun send(
+        format: DataParamsFormat,
+        sent: MutableList<String>,
+        answer: suspend (wrapped: Boolean) -> V1Response,
+    ): V1Response = sendDataCommand(format, loadMultiMapData(1)) { params: JsonElement, wrapped ->
+        sent += params.toString()
+        answer(wrapped)
+    }
+
+    @Test
+    fun wrapped_form_is_kept_when_the_robot_takes_it() = runTest {
+        val format = DataParamsFormat()
+        val sent = mutableListOf<String>()
+        assertEquals(ok, send(format, sent) { ok })
+        assertEquals(listOf("""{"data":[1],"need_retry":1}"""), sent)
+        assertFalse(format.plain)
+    }
+
+    @Test
+    fun refused_shape_falls_back_to_plain_and_stays_there() = runTest {
+        // Issue #14: the S7 answered the wrapped save_map with -10005 "Param is not an array".
+        val format = DataParamsFormat()
+        val sent = mutableListOf<String>()
+        val answer = send(format, sent) { wrapped -> if (wrapped) refused(-10005, "Param is not an array") else ok }
+        assertEquals(ok, answer)
+        assertEquals(listOf("""{"data":[1],"need_retry":1}""", "[1]"), sent)
+        assertTrue(format.plain)
+
+        sent.clear()
+        send(format, sent) { ok }
+        assertEquals(listOf("[1]"), sent)
+    }
+
+    @Test
+    fun silence_falls_back_to_plain() = runTest {
+        // Issue #11: the S5 Max never answered the wrapped load_multi_map.
+        val format = DataParamsFormat()
+        val sent = mutableListOf<String>()
+        val answer = send(format, sent) { wrapped -> if (wrapped) throw RobotSilentException("load_multi_map") else ok }
+        assertEquals(ok, answer)
+        assertEquals(listOf("""{"data":[1],"need_retry":1}""", "[1]"), sent)
+        assertTrue(format.plain)
+    }
+
+    @Test
+    fun other_refusals_are_not_retried() = runTest {
+        // -10006 "Split map failed" is about the line, not the shape: the split logic relies on it.
+        val format = DataParamsFormat()
+        val sent = mutableListOf<String>()
+        val answer = send(format, sent) { refused(SPLIT_FAILED_CODE, "Split map failed") }
+        assertEquals(SPLIT_FAILED_CODE, RobotCommandException("split_segment", answer.error!!).code())
+        assertEquals(1, sent.size)
+        assertFalse(format.plain)
+    }
+
+    @Test
+    fun plain_is_not_remembered_when_it_is_refused_too() = runTest {
+        // A value the robot rejects in either shape says nothing about the shape it takes.
+        val format = DataParamsFormat()
+        val sent = mutableListOf<String>()
+        val answer = send(format, sent) { refused(-10005, "Invalid parameters") }
+        assertEquals(PARAM_FORMAT_REFUSED_CODE, RobotCommandException("set_lab_status", answer.error!!).code())
+        assertEquals(2, sent.size)
+        assertFalse(format.plain)
+    }
+
+    @Test
+    fun a_refusal_in_plain_form_is_reported_and_plain_is_kept() = runTest {
+        val format = DataParamsFormat()
+        val sent = mutableListOf<String>()
+        val answer = send(format, sent) { wrapped ->
+            if (wrapped) refused(-10005, "Param is not an array") else refused(SPLIT_FAILED_CODE, "Split map failed")
+        }
+        assertEquals(SPLIT_FAILED_CODE, RobotCommandException("split_segment", answer.error!!).code())
+        assertTrue(format.plain)
     }
 
     @Test
