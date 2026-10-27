@@ -156,7 +156,7 @@ import com.kodraliu.localrock.ui.AppColors
 import kotlinx.coroutines.delay
 
 
-private val FAN_OPTIONS = listOf(
+internal val FAN_OPTIONS = listOf(
     VacuumFanPower.QUIET to "Quiet",
     VacuumFanPower.BALANCED to "Standard",
     VacuumFanPower.TURBO to "Strong",
@@ -166,14 +166,14 @@ private val FAN_OPTIONS = listOf(
 /** A room can also go without suction, the official app's mop-only setting. */
 private val ROOM_FAN_OPTIONS = listOf(VacuumFanPower.OFF to "Off") + FAN_OPTIONS
 
-private val WATER_OPTIONS = listOf(
+internal val WATER_OPTIONS = listOf(
     WaterBoxMode.OFF to "Off",
     WaterBoxMode.LOW to "Low",
     WaterBoxMode.MEDIUM to "Med",
     WaterBoxMode.HIGH to "High",
 )
 
-private val ROUTE_OPTIONS = listOf(
+internal val ROUTE_OPTIONS = listOf(
     MopRoute.STANDARD to "Standard",
     MopRoute.DEEP to "Deep",
     MopRoute.DEEP_PLUS to "Deep+",
@@ -1415,7 +1415,7 @@ private fun RoomCleanModesEditor(
 }
 
 @Composable
-private fun ModeOptionSelector(label: String, options: List<String>, selectedIndex: Int, enabled: Boolean, onSelect: (Int) -> Unit) {
+internal fun ModeOptionSelector(label: String, options: List<String>, selectedIndex: Int, enabled: Boolean, onSelect: (Int) -> Unit) {
     val currentValue = options.getOrElse(selectedIndex) { "" }
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {

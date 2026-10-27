@@ -767,34 +767,43 @@ class VacuumRepository(
         runCatching { rooms() }
     }
 
+    /** Re-reads the robot's timers. Throws when it can't, so callers never act on a stale list. */
     suspend fun fetchTimers() {
-        val resp = session.getTimer()
-        val result = resp.result ?: return
-        if (result !is JsonArray) return
-        val parsed = result.mapNotNull { entry ->
+        val result = session.getTimer().requireOk("get_timer").result as? JsonArray
+            ?: throw IllegalStateException("The robot sent an unreadable schedule list")
+        _timers.value = result.mapNotNull { entry ->
             if (entry !is JsonArray || entry.size < 3) return@mapNotNull null
             val id = entry[0].jsonPrimitive.contentOrNull ?: return@mapNotNull null
             val enabled = entry[1].jsonPrimitive.contentOrNull == "on"
             val details = runCatching { entry[2].jsonArray }.getOrNull() ?: return@mapNotNull null
             val cron = details.firstOrNull()?.jsonPrimitive?.contentOrNull ?: return@mapNotNull null
-            parseCronTimer(id, enabled, cron)
+            // [cron, ["start_clean", {fan_power, water_box_mode, mop_mode, ...}]]
+            val data = runCatching { details[1].jsonArray[1].jsonObject }.getOrNull()
+            parseCronTimer(id, enabled, cron)?.copy(
+                fanPower = data?.get("fan_power")?.jsonPrimitive?.intOrNull,
+                waterBoxMode = data?.get("water_box_mode")?.jsonPrimitive?.intOrNull,
+                mopMode = data?.get("mop_mode")?.jsonPrimitive?.intOrNull,
+            )
         }
-        _timers.value = parsed
     }
 
-    /** Creates the timer on the robot and re-reads the list, so only timers it kept are shown. */
-    suspend fun createTimer(hour: Int, minute: Int, weekdays: Set<Int>) {
-        val id = (nowEpochSeconds().toLong() * 1000).toString()
-        val status = _status.value
-        session.setTimer(
-            id = id,
-            cron = buildCron(minute, hour, weekdays),
-            fanPower = status.fanPower ?: TIMER_DEFAULT_FAN_POWER,
-            waterBoxMode = status.waterBoxCustomMode ?: TIMER_DEFAULT_WATER_BOX_MODE,
-            mopMode = status.mopMode ?: TIMER_DEFAULT_MOP_MODE,
-        )
-        fetchTimers()
-        if (_timers.value.none { it.id == id }) error("The robot accepted the routine but did not save it")
+    /** Last timer id handed out, so two timers made within one second still get distinct ids. */
+    private var lastTimerId = 0L
+
+    /**
+     * Creates the timer on the robot and re-reads the list, so only timers it kept are shown. The
+     * clean settings are stored in the timer, so the user picks them rather than inheriting the
+     * robot's current (possibly SmartPlan or one-off) mode.
+     */
+    suspend fun createTimer(hour: Int, minute: Int, weekdays: Set<Int>, fanPower: Int, waterBoxMode: Int, mopMode: Int) {
+        val id = maxOf(nowEpochSeconds().toLong() * 1000, lastTimerId + 1).also { lastTimerId = it }.toString()
+        session.setTimer(id, buildCron(minute, hour, weekdays), fanPower, waterBoxMode, mopMode)
+        try {
+            fetchTimers()
+        } catch (e: Exception) {
+            throw IllegalStateException("The schedule was saved, but the list couldn't be refreshed. Reopen Schedule to see it.", e)
+        }
+        if (_timers.value.none { it.id == id }) error("The robot accepted the schedule but did not save it")
     }
 
     suspend fun toggleTimer(timer: CleanTimer) {
@@ -1068,12 +1077,6 @@ class VacuumRepository(
         )
     }
 }
-
-// Fallbacks for a timer's clean settings when get_status hasn't reported them yet (Qrevo S5V
-// defaults, captured 2026-10-09).
-private const val TIMER_DEFAULT_FAN_POWER = 103
-private const val TIMER_DEFAULT_WATER_BOX_MODE = 202
-private const val TIMER_DEFAULT_MOP_MODE = 300
 
 private fun buildCron(minute: Int, hour: Int, weekdays: Set<Int>): String {
     val days = if (weekdays.isEmpty()) "*" else weekdays.sorted().joinToString(",")

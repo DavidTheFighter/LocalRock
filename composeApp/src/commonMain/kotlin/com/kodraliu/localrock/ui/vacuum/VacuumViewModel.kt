@@ -147,18 +147,29 @@ class VacuumViewModel(
         container.messages.success("Default order removed")
     }
 
-    fun run(successMessage: String? = null, action: suspend (VacuumRepository) -> Unit) {
+    /**
+     * Runs [action], posting [successMessage] or the error. [refreshStatus] re-reads get_status
+     * afterwards, which actions that don't touch the robot's state can skip. [onDone] runs either
+     * way, after the outcome is posted.
+     */
+    fun run(
+        successMessage: String? = null,
+        refreshStatus: Boolean = true,
+        onDone: () -> Unit = {},
+        action: suspend (VacuumRepository) -> Unit,
+    ) {
         viewModelScope.launch {
             _busy.value = true
             try {
                 action(repository)
 
-                runCatching { repository.refreshStatus() }
+                if (refreshStatus) runCatching { repository.refreshStatus() }
                 successMessage?.let { container.messages.success(it) }
             } catch (e: Throwable) {
                 container.messages.error(describe(e))
             } finally {
                 _busy.value = false
+                onDone()
             }
         }
     }
